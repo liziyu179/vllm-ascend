@@ -980,7 +980,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 self.get_finished_kv_transfer(scheduler_output))
             # For the case of no forward caused by receiving remote kv,
             # one round of dummy inference is necessary
-            # to prevent any hang issue caused by collective calls.
+            # to prevent hang over the collective calls.
             if finished_recving is not None and len(finished_recving) > 0:
                 self._dummy_run(1)
         if not finsihed_sending and not finished_recving:
@@ -1262,6 +1262,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         """
         import torch_npu
         kv_caches: Dict[str, torch.Tensor] = {}
+
+        def align_memory(tensor: torch.Tensor, alignment: int):
+            data_ptr = tensor.data_ptr()
+            aligned_addr =(data_ptr + alignment - 1) // alignment * alignment
+            offset = (aligned_addr - data_ptr) // tensor.element_size()
+            return tensor[offset]
+
         if not (vllm_version_is("0.8.5") or vllm_version_is("0.8.5.post1")):
             self.input_batch = InputBatch(
                 max_num_reqs=self.max_num_reqs,
@@ -1287,6 +1294,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 # different GPUs, and `kv_cache_config.num_blocks` is set to
                 # the min of all `num_blocks`. Verify it here.
                 assert num_blocks >= kv_cache_config.num_blocks
+                alignment = 2 * 1024 * 1024
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
                 # encounter OOM issue
                 if isinstance(kv_cache_spec, FullAttentionSpec):
@@ -1294,42 +1302,33 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         num_blocks, kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
                     dtype = kv_cache_spec.dtype
-                    if self.enable_torchair_graph_mode:
-                        layer_kv_cache_nope = torch.zeros(
-                            kv_cache_shape[:-1] +
-                            (self.model_config.hf_text_config.kv_lora_rank, ),
-                            dtype=self.dtype,
-                            pin_memory=True,
-                            device=self.device)
-                        layer_kv_cache_pe = torch.zeros(
-                            kv_cache_shape[:-1] +
-                            (self.model_config.hf_text_config.qk_rope_head_dim,
-                             ),
-                            dtype=self.dtype,
-                            pin_memory=True,
-                            device=self.device)
-                        kv_caches[layer_name] = (layer_kv_cache_nope,
-                                                 layer_kv_cache_pe)
-                        torch_npu.npu_format_cast(kv_caches[layer_name][0], 2)
-                        torch_npu.npu_format_cast(kv_caches[layer_name][1], 2)
+                    if self.model_config.is_deepseek_mla:
+                        # In order to transfer kv cache through the reigster_memory api from llmdatadist, the memory 
+                        # address should be aligned by 2M. In most case, torch_npu can allocate 2M aligned memory, but 
+                        # we found there are also some exceptions during test, so we manual align those memory here, this part
+                        # of code may consume 2M * 2 * elem_size memory every layer.
+                        num_blocks, block_size, num_kv_heads, head_size = kv_cache_shape
+                        rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
+                        nope_dim = head_size - rope_dim
+                        nope_allocate_shape = num_blocks * block_size * num_kv_heads * nope_dim
+                        nope_allocate_shape_alignment = nope_allocate_shape + alignment
+                        rope_allocate_shape = num_blocks * block_size * num_kv_heads * rope_dim
+                        rope_allocate_shape_alignment = rope_allocate_shape + alignment
+                        nope_cache_shape = (num_blocks, block_size, num_kv_heads, nope_dim)
+                        rope_cache_shape = (num_blocks, block_size, num_kv_heads, rope_dim)
+                        rope_cache = torch.zeros(nope_allocate_shape_alignment, dtype=dtype, device=self.device)
+                        nope_cache = torch.zeros(rope_allocate_shape_alignment, dtype=dtype, device=self.device)
+                        rope_cache = align_memory(nope_cache, alignment)[:nope_allocate_shape].view(nope_cache_shape)
+                        nope_cache = align_memory(rope_cache, alignment)[:rope_allocate_shape].view(rope_cache_shape)
+                        kv_caches[layer_name] = (nope_cache, rope_cache)
                     else:
-                        if self.model_config.is_deepseek_mla:
-                            num_blocks, block_size, num_kv_heads, head_size = kv_cache_shape
-                            rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
-                            nope_dim = head_size - rope_dim
-                            nope_cache_shape = (num_blocks, block_size, num_kv_heads, nope_dim)
-                            rope_cache_shape = (num_blocks, block_size, num_kv_heads, rope_dim)
-                            nope_cache = torch.zeros(nope_cache_shape, dtype=dtype, device=self.device)
-                            rope_cache = torch.zeros(rope_cache_shape, dtype=dtype, device=self.device)
-                            kv_caches[layer_name] = (nope_cache, rope_cache)
-                        else:
-                            num_caches = kv_cache_shape[0]
-                            kv_cache_list = []
-                            for i in range(num_caches):
-                                cache_shape = kv_cache_shape[1:]
-                                kv_cache_for_compute = torch.zeros(cache_shape, dtype=dtype, device=self.device)
-                                kv_cache_list.append(kv_cache_for_compute)
-                            kv_caches[layer_name] = kv_cache_list
+                        num_caches = kv_cache_shape[0]
+                        kv_cache_list = []
+                        for i in range(num_caches):
+                            cache_shape = kv_cache_shape[1:]
+                            kv_cache_for_compute = torch.zeros(cache_shape, dtype=dtype, device=self.device)
+                            kv_cache_list.append(kv_cache_for_compute)
+                        kv_caches[layer_name] = kv_cache_list
                         # torch_npu.npu_format_cast(kv_caches[layer_name], 2)
                 else:
                     # TODO: add new branches when introducing more types of

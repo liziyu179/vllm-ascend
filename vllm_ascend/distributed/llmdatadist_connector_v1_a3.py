@@ -162,6 +162,9 @@ class LLMDataDistConnectorScheduler():
      self.block_size = vllm_config.cache_config.block_size
      self.engine_id = engine_id
      self.local_ip = get_ip()
+     # Can not retrive the parallel config since it is not initialized.
+     self.local_dp_rank = None
+     self.tp_size = None
 
      self._reqs_need_recv: dict[str, tuple[Request, list[int]]] = {}
 
@@ -239,6 +242,13 @@ class LLMDataDistConnectorScheduler():
       request: "Request",
       block_ids: list[int],
   ) -> tuple[bool, Optional[dict[str, Any]]]:
+    if self.local_dp_rank is None:
+      vllm_config = get_current_vllm_config()
+      # Need this dp rank to locate the only dp rank the kv cache from
+      self.local_dp_rank = vllm_config.parallel_config.data_parallel_rank_local
+      # Need this tp size to offset the port in tp size
+      self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+
     params = request.kv_transfer_params
     logger.debug(
         "LLMDataDistConnector request_finished, request_status=%s, "
@@ -261,7 +271,7 @@ class LLMDataDistConnectorScheduler():
         remote_block_ids=computed_block_ids,
         remote_engine_id=self.engine_id,
         remote_host=self.local_ip,
-        remote_port=envs.VLLM_LLMDD_CHANNEL_PORT,
+        remote_port=envs.VLLM_LLMDD_CHANNEL_PORT + self.local_dp_rank * self.tp_size,
     )
 
 class LLMDataDistConnectorWorker():
@@ -272,11 +282,13 @@ class LLMDataDistConnectorWorker():
         self,
         vllm_config: VllmConfig):
       logger.info("Initialize the LLMDataDistConnectorWorker")
-      # we assume the local node only contains dp and tp and pp, and tp, pp will not communicate inter-node.
+      # we assume the local node only contains dp and tp, and tp will not communicate inter-node.
       # for any scenario beyond this scope, the functionality of this connector is not guaranteed.
       self.local_rank = get_world_group().rank % (vllm_config.parallel_config.data_parallel_size_local * 
-                                                  vllm_config.parallel_config.tensor_parallel_size * 
-                                                  vllm_config.parallel_config.pipeline_parallel_size)
+                                                  vllm_config.parallel_config.tensor_parallel_size)
+      self.local_dp_rank = vllm_config.parallel_config.data_parallel_rank_local
+      self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+      self.tp_rank = get_tp_group().rank_in_group
       self.rank = get_world_group().rank
       self.local_ip = get_ip()
       self.kv_transfer_config: Optional[KVTransferConfig] = vllm_config.kv_transfer_config
@@ -309,7 +321,7 @@ class LLMDataDistConnectorWorker():
 
 
   def listen_for_agent_metadat_req(self, event: threading.Event):
-    port = envs.VLLM_LLMDD_CHANNEL_PORT + self.local_rank
+    port = envs.VLLM_LLMDD_CHANNEL_PORT + self.local_dp_rank * self.tp_size
     url = f"tcp://0.0.0.0:{port}"
     msg_encoder = msgspec.msgpack.Encoder()
     msg_decoder = msgspec.msgpack.Decoder()
@@ -399,39 +411,6 @@ class LLMDataDistConnectorWorker():
         break
     assert agent_metadata is not None, f"Can't read the target server_id {server_id} and device_id {device_id} from rank table"
     return agent_metadata
-
-  def get_remote_ip_and_rank(self):
-    local_info = (self.local_ip, str(self.local_rank))
-    remote_device_ids = []
-    remote_ranks = []
-    if self.llm_datadist_role == LLMRole.PROMPT:
-      remote_device_list = self.decode_device_list
-      device_list = self.prefill_device_list
-    elif self.llm_datadist_role == LLMRole.DECODER:
-      remote_device_list = self.prefill_device_list
-      device_list = self.decode_device_list
-    else:
-      raise RuntimeError(f"kv_both role in LLMDataDist is not supported now")
-    remote_list_num = len(remote_device_list)
-    list_num = len(device_list)
-    local_idx = device_list.index(local_info)
-    if remote_list_num >= list_num:
-      for idx in range(local_idx, remote_list_num, list_num):
-        device_ids, ranks = remote_device_list[idx]
-        remote_device_ids.append(device_ids)
-        remote_ranks.append(ranks)
-    else:
-      device_id, rank = remote_device_list[local_idx % remote_list_num]
-      remote_device_ids.append(device_id)
-      remote_ranks.append(rank)
-    return remote_device_ids, remote_ranks
-
-
-  def init_cluster_info(self, global_rank_table):
-    if self.kv_transfer_config.kv_role == "kv_producer":
-      self.cluster_id = global_rank_table["prefill_device_list"][self.rank]["cluster_id"]
-    else:
-      self.cluster_id = global_rank_table["decode_device_list"][self.rank]["cluster_id"]
 
 
   def register_kv_caches(self, kv_caches: dict[str, Tuple[torch.Tensor]]):
@@ -652,7 +631,7 @@ class LLMDataDistConnectorWorker():
     host: str,
     port: int
   ):
-    url = f"tcp://{host}:{port + self.local_rank}"
+    url = f"tcp://{host}:{port + self.tp_rank}"
     logger.debug(f"Querying metadata from url: {url}")
     msg_encoder = msgspec.msgpack.Encoder()
     msg_send = msg_encoder.encode(self.local_agent_metadata)
@@ -719,7 +698,7 @@ class LLMDataDistConnectorWorker():
     else:
       return None, req_ids_to_ret
 
-
+# adopt this from  https://github.com/vllm-project/vllm/blob/main/vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py
 @contextlib.contextmanager
 def zmq_ctx(socket_type: Any, addr: str) -> Iterator[zmq.Socket]:
     """Context manager for a ZMQ socket"""

@@ -15,13 +15,15 @@
 # This file is a part of the vllm-ascend project.
 #
 from collections import deque
-from typing import Iterable, Optional, Union
+from typing import Iterable, Optional, Union, Any
 
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.utils import cdiv
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+from vllm.distributed.kv_transfer.kv_connector.factory import (KVConnectorFactory)
+from vllm.distributed.kv_transfer.kv_connector.v1 import (KVConnectorBase_V1, KVConnectorRole)
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
@@ -448,6 +450,7 @@ class AscendScheduler(Scheduler):
             stopped = False
             new_logprobs = None
             new_token_ids = generated_token_ids
+            kv_transfer_params = None
 
             # Append generated tokens and check for stop. Note that if
             # a request is still being prefilled, we expect the model runner
@@ -459,7 +462,7 @@ class AscendScheduler(Scheduler):
                 # This must be called before we make the EngineCoreOutput.
                 stopped = check_stop(request, self.max_model_len)
                 if stopped:
-                    self._free_request(request)
+                    kv_transfer_params = self._free_request(request)
                     del new_token_ids[num_new:]  # Trim new tokens if needed.
                     break
 
@@ -489,7 +492,7 @@ class AscendScheduler(Scheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids:
+            if new_token_ids or kv_transfer_params:
                 # Add EngineCoreOutput for this Request.
                 outputs.append(
                     EngineCoreOutput(
@@ -499,7 +502,10 @@ class AscendScheduler(Scheduler):
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         stop_reason=request.stop_reason,
-                        events=request.take_events()))
+                        events=request.take_events(),
+                        kv_transfer_params=kv_transfer_params,
+                        num_cached_tokens=request.num_cached_tokens,
+                    ))
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
@@ -526,3 +532,79 @@ class AscendScheduler(Scheduler):
                 scheduler_output.finished_req_ids | self.finished_req_ids)
 
         return engine_core_outputs
+
+
+    ########################################################################
+    # P/D Related Methods
+    ########################################################################
+
+    def get_kv_connector(self) -> Optional[KVConnectorBase_V1]:
+        return self.connector
+
+    def _connector_finished(
+            self, request: Request) -> tuple[bool, Optional[dict[str, Any]]]:
+        """
+        Invoke the KV connector request_finished() method if applicable.
+
+        Returns optional kv transfer parameters to be included with the
+        request outputs.
+        """
+        if self.connector is None:
+            return False, None
+        assert len(self.kv_cache_config.kv_cache_groups
+                   ) == 1, "KV connector only supports one KV cache group now"
+        block_ids = self.kv_cache_manager.get_block_ids(request.request_id)[0]
+        return self.connector.request_finished(request, block_ids)
+
+    def _update_waiting_for_remote_kv(self, request: Request) -> bool:
+        """
+        P/D: check if the request_id is finished_recving.
+
+        The finished_recving_kv_req_ids list is populated
+        on the previous steps()'s update_from_output based
+        on the worker side connector.
+
+        When the kv transfer is ready, we cache the blocks
+        and the request state will be moved back to WAITING from
+        WAITING_FOR_REMOTE_KV.
+        """
+        if request.request_id not in self.finished_recving_kv_req_ids:
+            return False
+        assert len(self.kv_cache_config.kv_cache_groups
+                   ) == 1, "KV connector only supports one KV cache group now"
+        # Now that the blocks are ready, actually cache them.
+        block_ids = self.kv_cache_manager.get_block_ids(request.request_id)[0]
+        num_computed_tokens = len(block_ids) * self.block_size
+        if num_computed_tokens == request.num_tokens:
+            num_computed_tokens -= 1
+        self.kv_cache_manager.single_type_manager.cache_blocks(
+            request,
+            self.kv_cache_manager.req_to_block_hashes[request.request_id],
+            num_computed_tokens,
+        )
+
+        # Update the request state for scheduling.
+        request.num_computed_tokens = num_computed_tokens
+
+        # Return that we are ready.
+        self.finished_recving_kv_req_ids.remove(request.request_id)
+        return True
+
+    def _update_from_kv_xfer_finished(self,
+                                      model_runner_output: ModelRunnerOutput):
+        """
+        P/D: update the scheduler state based on the output.
+
+        The Worker side connectors add finished_recving and
+        finished_sending reqs to the output.
+        * if finished_sending: free the blocks
+        # if finished_recving: add to state so we can
+            scheduler the request during the next step.
+        """
+        # P/D: update recv and send status from last step.
+        for req_id in (model_runner_output.finished_recving or ()):
+            logger.debug("Finished recving KV transfer for request %s", req_id)
+            self.finished_recving_kv_req_ids.add(req_id)
+        for req_id in (model_runner_output.finished_sending or ()):
+            logger.debug("Finished sending KV transfer for request %s", req_id)
+            self._free_blocks(self.requests[req_id])
