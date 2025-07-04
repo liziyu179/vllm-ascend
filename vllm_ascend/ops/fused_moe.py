@@ -26,11 +26,11 @@ from vllm.config import get_current_vllm_config
 from vllm.distributed import (GroupCoordinator, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
-from vllm.distributed.parallel_state import get_dp_group, get_tp_group
+from vllm.distributed.parallel_state import (get_dp_group, get_tp_group,
+                                             get_world_group)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.layer import (
-    FusedMoE, FusedMoEParallelConfig, MoEConfig, UnquantizedFusedMoEMethod,
-    determine_expert_map)
+    FusedMoE, UnquantizedFusedMoEMethod, determine_expert_map)
 from vllm.model_executor.layers.quantization.base_config import \
     QuantizationConfig
 
@@ -39,8 +39,17 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_ep_group, get_etp_group
 from vllm_ascend.ops.expert_load_balancer import ExpertLoadBalancer
 from vllm_ascend.utils import (FusedMoEState, dispose_tensor,
-                               get_fused_moe_state, npu_stream_switch,
-                               npu_wait_tensor)
+                               get_fused_moe_state, is_310p, npu_stream_switch,
+                               npu_wait_tensor, vllm_version_is)
+
+if vllm_version_is("0.9.1"):
+    from vllm.model_executor.layers.fused_moe.layer import \
+        FusedMoEParallelConfig
+    from vllm.model_executor.layers.fused_moe.layer import \
+        MoEConfig as FusedMoEConfig
+else:
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig, FusedMoEParallelConfig)
 
 MOE_ALL2ALL_BUFFER: bool = envs_ascend.MOE_ALL2ALL_BUFFER
 
@@ -155,7 +164,6 @@ def fused_experts_with_mc2(
     kwargs_mc2.update(stage1_kwargs)
 
     output = torch_npu.npu_moe_distribute_dispatch(**kwargs_mc2)
-    # comm_stream.wait_stream(torch.npu.current_stream())
     expand_x, dynamic_scale, expand_idx, expert_token_nums, ep_recv_counts = output[
         0:5]
 
@@ -549,8 +557,7 @@ def fused_experts_with_all2all_buffer(
     return final_hidden_states
 
 
-# Currently, fused_experts on 310p only supports PanguProMoE.
-def fused_experts_310p(
+def fused_experts_moge(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -615,8 +622,11 @@ def fused_experts_310p(
         group_list=group_list,
     )[0]
 
-    gate_up_out = torch_npu.npu_swiglu(gate_up_out.to(torch.float32)).to(
-        torch.float16)
+    if is_310p():
+        gate_up_out = torch_npu.npu_swiglu(gate_up_out.to(torch.float32)).to(
+            torch.float16)
+    else:
+        gate_up_out = torch_npu.npu_swiglu(gate_up_out)
     gate_up_out *= topk_scales
 
     w2 = w2.transpose(1, 2)
@@ -629,8 +639,7 @@ def fused_experts_310p(
         group_list=group_list,
     )[0]
 
-    unsorted_topk_ids = torch.argsort(sorted_topk_ids.float()).to(
-        torch.int32) + torch.Tensor([0]).to(torch.int32).npu()
+    unsorted_topk_ids = torch.argsort(sorted_topk_ids.float()).to(torch.int32)
     unsorted_hidden_states = down_out_list.index_select(0, unsorted_topk_ids)
     final_hidden_states = unsorted_hidden_states.reshape(
         bsz, top_k // ep_size, -1).sum(1)
@@ -933,7 +942,7 @@ def select_experts(
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
-    def __init__(self, moe: MoEConfig = None):
+    def __init__(self, moe: FusedMoEConfig = None):
 
         super().__init__(moe=moe)
         vllm_config = get_current_vllm_config()
@@ -1110,13 +1119,21 @@ class AscendFusedMoE(FusedMoE):
 
         vllm_config = get_current_vllm_config()
 
-        self.moe_parallel_config: FusedMoEParallelConfig = (
-            FusedMoEParallelConfig.make(
+        if vllm_version_is("0.9.1"):
+            self.moe_parallel_config = FusedMoEParallelConfig.make(
                 tp_size_=(tp_size if tp_size is not None else
                           get_tensor_model_parallel_world_size()),
                 dp_size_=(dp_size if dp_size is not None else
                           get_dp_group().world_size),
-                vllm_parallel_config=vllm_config.parallel_config))
+                vllm_parallel_config=vllm_config.parallel_config)
+        else:
+            self.moe_parallel_config = FusedMoEParallelConfig.make(
+                tp_size_=(tp_size if tp_size is not None else
+                          get_tensor_model_parallel_world_size()),
+                dp_size_=(dp_size if dp_size is not None else
+                          get_dp_group().world_size),
+                world_size_=get_world_group().world_size,
+                vllm_parallel_config=vllm_config.parallel_config)
 
         self.top_k = top_k
         self.num_experts = num_experts
@@ -1167,15 +1184,26 @@ class AscendFusedMoE(FusedMoE):
             raise ValueError("Only softmax scoring function is supported for "
                              "non-grouped topk.")
 
-        moe = MoEConfig(
-            num_experts=self.global_num_experts,
-            experts_per_token=top_k,
-            hidden_dim=hidden_size,
-            num_local_experts=self.local_num_experts,
-            moe_parallel_config=self.moe_parallel_config,
-            # TODO (bnell): this needs to be fixed for quantized types.
-            in_dtype=params_dtype,
-        )
+        if vllm_version_is("0.9.1"):
+            moe = FusedMoEConfig(
+                num_experts=self.global_num_experts,
+                experts_per_token=top_k,
+                hidden_dim=hidden_size,
+                num_local_experts=self.local_num_experts,
+                moe_parallel_config=self.moe_parallel_config,
+                # TODO (bnell): this needs to be fixed for quantized types.
+                in_dtype=params_dtype,
+            )
+        else:
+            moe = FusedMoEConfig.make(
+                num_experts=self.global_num_experts,
+                experts_per_token=top_k,
+                hidden_dim=hidden_size,
+                num_local_experts=self.local_num_experts,
+                moe_parallel_config=self.moe_parallel_config,
+                # TODO (bnell): this needs to be fixed for quantized types.
+                in_dtype=params_dtype,
+                quant_config=quant_config)
 
         if quant_config is None:
             self.quant_method = AscendUnquantizedFusedMoEMethod(moe)
@@ -1211,7 +1239,8 @@ class AscendFusedMoE(FusedMoE):
                 is_prefill: bool,
                 enable_force_load_balance: bool = False,
                 top_k: Optional[int] = None,
-                shared_experts: Optional[Any] = None):
+                shared_experts: Optional[Any] = None,
+                replace_allreduce: bool = False):
         assert self.quant_method is not None
 
         if top_k:
@@ -1230,7 +1259,8 @@ class AscendFusedMoE(FusedMoE):
 
         tp_size = get_tensor_model_parallel_world_size()
         if (tp_size > 1 and fused_moe_state != FusedMoEState.AllGather
-                and fused_moe_state != FusedMoEState.AllGatherEP):
+                and fused_moe_state != FusedMoEState.AllGatherEP
+                and not replace_allreduce):
             if num_tokens < tp_size:
                 hidden_states = nn.functional.pad(
                     hidden_states, (0, 0, 0, tp_size - num_tokens))
@@ -1289,7 +1319,8 @@ class AscendFusedMoE(FusedMoE):
                 e_hidden_states, shared_hidden_states = e_hidden_states
 
         if (tp_size > 1 and fused_moe_state != FusedMoEState.AllGather
-                and fused_moe_state != FusedMoEState.AllGatherEP):
+                and fused_moe_state != FusedMoEState.AllGatherEP
+                and not replace_allreduce):
             dist.all_gather(list(chunk_hidden_states), e_hidden_states,
                             self.tp_group)
             final_hidden_states = torch.cat(chunk_hidden_states, dim=0)

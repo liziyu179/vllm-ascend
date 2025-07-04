@@ -1,9 +1,10 @@
 # Graph Mode Guide
 
-
+```{note}
 This feature is currently experimental. In future versions, there may be behavioral changes around configuration, coverage, performance improvement.
+```
 
-This guide provides instructions for using Ascend Graph Mode with vLLM Ascend. Please note that graph mode is only available on V1 Engine. And only Qwen, DeepSeek series models are well tested in 0.9.0rc1. We'll make it stable and generalize in the next release.
+This guide provides instructions for using Ascend Graph Mode with vLLM Ascend. Please note that graph mode is only available on V1 Engine. And only Qwen, DeepSeek series models are well tested from 0.9.0rc1. We'll make it stable and generalize in the next release.
 
 ## Getting Started
 
@@ -11,7 +12,7 @@ From v0.9.1rc1 with V1 Engine, vLLM Ascend will run models in graph mode by defa
 
 There are two kinds for graph mode supported by vLLM Ascend:
 - **ACLGraph**: This is the default graph mode supported by vLLM Ascend. In v0.9.1rc1, only Qwen series models are well tested.
-- **TorchAirGraph**: This is the GE graph mode. In v0.9.1rc1, only DeepSeek series models are supported.
+- **TorchAirGraph**: This is the GE graph mode. In v0.9.1rc1, only DeepSeek series models are supported. In v0.9.1rc2, we also support PanguProMoe with torchair.
 
 ## Using ACLGraph
 ACLGraph is enabled by default. Take Qwen series models as an example, just set to use V1 Engine is enough.

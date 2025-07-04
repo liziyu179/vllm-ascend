@@ -23,7 +23,6 @@ from vllm.distributed.kv_events import KVEventBatch
 from vllm.logger import logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.utils import cdiv
-from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
@@ -31,6 +30,8 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
+
+from vllm_ascend.utils import vllm_version_is
 
 
 class AscendScheduler(Scheduler):
@@ -87,14 +88,11 @@ class AscendScheduler(Scheduler):
                 self.waiting.popleft()
                 skipped_waiting_requests.appendleft(request)
 
-            num_prealloc_computed_tokens = 0
             # P/D: skip request if still waiting for remote kvs.
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 is_ready = self._update_waiting_for_remote_kv(request)
                 if is_ready:
                     request.status = RequestStatus.WAITING
-                    num_prealloc_computed_tokens = (
-                        request.num_computed_tokens)
                 else:
                     skip_cur_request()
                     continue
@@ -112,8 +110,8 @@ class AscendScheduler(Scheduler):
             load_kv_async = False
 
             # Get already-cached tokens.
-            if num_prealloc_computed_tokens == 0:
-                new_computed_blocks, num_native_computed_tokens = \
+            if request.num_computed_tokens == 0:
+                new_computed_blocks, num_new_local_computed_tokens = \
                     self.kv_cache_manager.get_computed_blocks(
                         request)
 
@@ -121,18 +119,17 @@ class AscendScheduler(Scheduler):
                 if self.connector is not None:
                     num_external_computed_tokens, load_kv_async = (
                         self.connector.get_num_new_matched_tokens(
-                            request, num_native_computed_tokens))
+                            request, num_new_local_computed_tokens))
 
                 # Total computed tokens (local + external).
-                num_computed_tokens = (num_native_computed_tokens +
+                num_computed_tokens = (num_new_local_computed_tokens +
                                        num_external_computed_tokens)
             else:
                 # P/D: skip checking prefix cache if loaded from remote kvs.
-                new_computed_blocks = KVCacheBlocks.create_empty()
-                num_native_computed_tokens = 0
-
-                # Total computed tokens (allocated in prior step).
-                num_computed_tokens = num_prealloc_computed_tokens
+                new_computed_blocks = (
+                    self.kv_cache_manager.create_empty_block_list())
+                num_new_local_computed_tokens = 0
+                num_computed_tokens = request.num_computed_tokens
 
             # P/D: loading remote KV, do not allocate for new work.
             if load_kv_async:
@@ -142,9 +139,6 @@ class AscendScheduler(Scheduler):
             # Number of tokens to be scheduled.
             else:
                 prompt_limit = self._get_prompt_limit(request)
-                # Get already-cached tokens.
-                computed_blocks, num_computed_tokens = (
-                    self.kv_cache_manager.get_computed_blocks(request))
                 # We use `request.num_tokens` instead of
                 # `request.num_prompt_tokens` to consider the resumed
                 # requests, which have output tokens.
@@ -172,7 +166,7 @@ class AscendScheduler(Scheduler):
                     skip_cur_request()
                     continue
                 assert num_new_tokens > 0
-                blocks = computed_blocks.blocks[0]
+                blocks = new_computed_blocks.blocks[0]
 
             watermark = getattr(self.scheduler_config, "watermark", 0.01)
             if not self._check_watermark_for_prefill(request, num_new_tokens,
@@ -184,8 +178,8 @@ class AscendScheduler(Scheduler):
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
                 num_new_tokens + num_external_computed_tokens,
-                num_native_computed_tokens,
-                new_computed_blocks=computed_blocks,
+                num_new_local_computed_tokens,
+                new_computed_blocks=new_computed_blocks,
                 num_lookahead_tokens=self.num_lookahead_tokens,
                 delay_cache_blocks=load_kv_async)
             if new_blocks is None:
@@ -195,8 +189,7 @@ class AscendScheduler(Scheduler):
             # KVConnector: update internal state after allocation.
             # This information is used to determine if a load is
             # needed for this request.
-            if num_external_computed_tokens:
-                assert self.connector is not None
+            if self.connector is not None:
                 self.connector.update_state_after_alloc(
                     request,
                     new_computed_blocks + new_blocks,
@@ -210,6 +203,7 @@ class AscendScheduler(Scheduler):
                 skipped_waiting_requests.appendleft(request)
                 request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                 continue
+
             self.running.append(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.SCHEDULED,
@@ -364,27 +358,36 @@ class AscendScheduler(Scheduler):
                                         req_to_new_block_ids[req.request_id])
             for req in scheduled_new_reqs
         ]
-        resumed_reqs_data = [
-            self._make_cached_request_data(
-                req,
-                num_scheduled_tokens[req.request_id],
-                len(scheduled_spec_decode_tokens.get(req.request_id, ())),
-                req_to_new_block_ids[req.request_id],
-                resumed_from_preemption=True,
-            ) for req in scheduled_resumed_reqs
-        ]
-        running_reqs_data = [
-            self._make_cached_request_data(
-                req,
-                num_scheduled_tokens[req.request_id],
-                len(scheduled_spec_decode_tokens.get(req.request_id, ())),
-                req_to_new_block_ids[req.request_id],
-                resumed_from_preemption=False,
-            ) for req in scheduled_running_reqs
-        ]
+        if vllm_version_is("0.9.1"):
+            resumed_reqs_data = [
+                self._make_cached_request_data(
+                    req,
+                    num_scheduled_tokens[req.request_id],
+                    len(scheduled_spec_decode_tokens.get(req.request_id, ())),
+                    req_to_new_block_ids[req.request_id],
+                    resumed_from_preemption=True,
+                ) for req in scheduled_resumed_reqs
+            ]
+            running_reqs_data = [
+                self._make_cached_request_data(
+                    req,
+                    num_scheduled_tokens[req.request_id],
+                    len(scheduled_spec_decode_tokens.get(req.request_id, ())),
+                    req_to_new_block_ids[req.request_id],
+                    resumed_from_preemption=False,
+                ) for req in scheduled_running_reqs
+            ]
+            scheduled_cached_reqs = resumed_reqs_data + running_reqs_data
+        else:
+            cached_reqs_data = self._make_cached_request_data(
+                scheduled_running_reqs, scheduled_resumed_reqs,
+                num_scheduled_tokens, scheduled_spec_decode_tokens,
+                req_to_new_block_ids)
+            scheduled_cached_reqs = cached_reqs_data
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
-            scheduled_cached_reqs=resumed_reqs_data + running_reqs_data,
+            scheduled_cached_reqs=scheduled_cached_reqs,
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
