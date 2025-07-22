@@ -31,7 +31,7 @@ from vllm.v1.worker.gpu_input_batch import InputBatch
 
 from vllm_ascend.ops.attention import vanilla_chunked_prefill
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ, aligned_16, is_310p,
-                               nd_to_nz_2d, nd_to_nz_spec)
+                               nd_to_nz_2d, nd_to_nz_spec, vllm_version_is)
 
 
 class AscendAttentionBackend(AttentionBackend):
@@ -43,6 +43,8 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> Type["AscendAttentionBackendImpl"]:
+        if vllm_version_is("0.9.2"):
+            return AscendAttentionBackendImpl092
         return AscendAttentionBackendImpl
 
     @staticmethod
@@ -68,6 +70,15 @@ class AscendAttentionBackend(AttentionBackend):
             return (2, num_blocks, num_kv_heads * head_size // 16, block_size,
                     16)
         return (2, num_blocks, block_size, num_kv_heads, head_size)
+
+    @staticmethod
+    def get_bsh_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+    ) -> Tuple[int, ...]:
+        return (2, num_blocks, block_size, num_kv_heads * head_size)
 
     @staticmethod
     def swap_blocks(
@@ -119,6 +130,10 @@ class AscendMetadata:
     query_start_loc: torch.Tensor
     query_lens: torch.Tensor
     seq_lens: torch.Tensor
+
+    # max value of number of tokens across dp group
+    max_num_tokens_across_dp: int = 0
+
     # Maximum query length in the batch. None for decoding.
     max_query_len: Optional[int] = None
     # (num_tokens,). The indices of the token slots that input tokens will be
@@ -155,6 +170,7 @@ class AscendAttentionMetadataBuilder:
               num_actual_tokens,
               max_query_len,
               common_prefix_len,
+              max_num_tokens_across_dp: int = 0,
               with_prefill_across_dp: bool = False):
 
         block_table = self.runner.input_batch.block_table[0].get_device_tensor(
@@ -192,6 +208,7 @@ class AscendAttentionMetadataBuilder:
             slot_mapping=slot_mapping,
             attn_mask=attn_mask,
             attn_state=attn_state,
+            max_num_tokens_across_dp=max_num_tokens_across_dp,
             with_prefill_across_dp=with_prefill_across_dp)
         return attn_metadata
 
@@ -207,7 +224,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         alibi_slopes: Optional[List[float]],
         sliding_window: Optional[int],
         kv_cache_dtype: str,
-        blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: Optional[str] = None,
@@ -238,7 +254,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        kv_cache: torch.Tensor,
+        kv_cache: Tuple[torch.Tensor],
         attn_metadata: AscendMetadata,
         output: Optional[torch.Tensor] = None,
         trace_flag: bool = True,
@@ -248,8 +264,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             query: shape = [batch_size, seq_len, num_heads * head_size]
             key: shape = [batch_size, seq_len, num_kv_heads * head_size]
             value: shape = [batch_size, seq_len, num_kv_heads * head_size]
-            kv_cache: shape = [2, num_blocks, block_size,
-                               num_kv_heads, head_size]
+            kv_cache: shape = [key_cache, value_cache]
                       key_cache = [num_blocks, block_size,
                                    num_kv_heads, head_size]
                       value_cache = [num_blocks, block_size,
@@ -259,6 +274,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             shape = [batch_size * seq_len, num_heads, head_size]
         """
         num_tokens = query.shape[0]
+        use_kv_cache_int8 = len(
+            kv_cache) > 0 and kv_cache[0].dtype == torch.int8
         if output is None:
             output = torch.empty(num_tokens,
                                  self.num_heads,
@@ -273,6 +290,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 value=value,
                 output=output,
                 layer_name=layer.layer_name)
+
+        elif hasattr(layer, 'quant_method') and use_kv_cache_int8:
+            output = layer.quant_method.apply(layer, query, key, value,
+                                              kv_cache, attn_metadata,
+                                              self.attn_type, self.scale,
+                                              output)
+
         else:
             if attn_metadata is None:
                 return output.view(num_tokens, self.hidden_size)
@@ -291,7 +315,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             # TODO: Remove this contiguous in the future.
             value = value.contiguous()
 
-            if kv_cache.numel() > 0:
+            if len(kv_cache) > 1:
                 if self.key_cache is None:
                     self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
                 slots = attn_metadata.slot_mapping
@@ -302,11 +326,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     value_cache=self.value_cache,
                     slot_indices=slots)
 
-            if hasattr(layer, 'quant_method'):
-                # TODO: Add attr (num_prefills, prefill_metadata, decode_metadata) to AscendMetadata
-                pass
             # V0-Style scheduler situation.
-            elif attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
+            if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
                 assert attn_metadata is not None
                 assert attn_metadata.attn_mask is not None
                 mask = attn_metadata.attn_mask
@@ -336,11 +357,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 assert attn_metadata is not None
                 assert attn_metadata.attn_mask is not None
                 compress_mask = attn_metadata.attn_mask
+                batch_size = attn_metadata.query_lens.shape[0]
+                block_table = attn_metadata.block_tables[:batch_size, :]
                 torch_npu._npu_flash_attention_qlens(
                     query=query,
                     key_cache=self.key_cache,
                     value_cache=self.value_cache,
-                    block_table=attn_metadata.block_tables,
+                    block_table=block_table,
                     mask=compress_mask,
                     seq_len=attn_metadata.query_lens,
                     context_lens=attn_metadata.seq_lens,
@@ -408,8 +431,42 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         out=output)
 
         # to make in-place change to the output tensor
+        if hasattr(layer, 'quant_method') and use_kv_cache_int8:
+            output = output.view(num_tokens, self.num_heads, self.head_size)
         ori_output[:, :, :] = output[:num_tokens, :, :]
         return output.view(num_tokens, self.hidden_size)
+
+
+class AscendAttentionBackendImpl092(AscendAttentionBackendImpl):
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int,
+        alibi_slopes: Optional[List[float]],
+        sliding_window: Optional[int],
+        kv_cache_dtype: str,
+        blocksparse_params: Optional[Dict[str, Any]] = None,
+        logits_soft_cap: Optional[float] = None,
+        attn_type: str = AttentionType.DECODER,
+        kv_sharing_target_layer_name: Optional[str] = None,
+        use_irope: bool = False,
+    ) -> None:
+        super().__init__(
+            num_heads=num_heads,
+            head_size=head_size,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            alibi_slopes=alibi_slopes,
+            sliding_window=sliding_window,
+            kv_cache_dtype=kv_cache_dtype,
+            logits_soft_cap=logits_soft_cap,
+            attn_type=attn_type,
+            kv_sharing_target_layer_name=kv_sharing_target_layer_name,
+            use_irope=use_irope,
+        )
 
 
 def unified_ascend_attention_with_output(
