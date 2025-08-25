@@ -126,7 +126,7 @@ class KVCacheTaskTracker:
                             f"{request_id}. Total ranks: "
                             f"{self.target_count}.")
 
-    def get_and_clear_finished_requests(self, decoder_ip, decoder_port) -> set[str]:
+    def get_and_clear_finished_requests(self) -> set[str]:
         """
         Get and clear the requests that have been completed.
         Returns:
@@ -250,7 +250,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         Returns:
             A set of request IDs that have been completed.
         """
-        return self.task_tracker.get_and_clear_finished_requests(decoder_ip, decoder_port)
+        return self.task_tracker.get_and_clear_finished_requests()
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -1058,23 +1058,38 @@ class MooncakeConnectorWorker:
                 remote_host=meta.remote_host,
                 remote_handshake_port=remote_handshake_port,
             )
+        #TODO layerwise step7
+        # decoder send request info to prefiller
+        # for request in metadata.requests:
+        #   send {
+        #     "request_id":"decode_request_id",
+        #     "remote_block_ids":"decode_block_ids",
+        #     "remote_engine_id":"decode_engine_id",
+        #     "remote_host":"decode_host",
+        #     "remote_port":decode_start_port
+        #     "remote_dp_rank":decode_dp_rank,
+        #     "remote_tp_size":decode_tp_size,
+        #     "te_rpc_port": "decode_rpc_port"
+        #     "kv_caches_base_addr": "decode_kv_caches_base_addr"
+        #     "num_blocks": "decode_num_blocks"
+        #   } to prefiller connector worker listen port (prefill_remote_port + prefill_dp_rank * prefill_tp_size + decode_tp_rank)
+        # for request in self._connector_metadata:
+        # TODO layerwise step4
+        # prefiler send request info to Meta Server
+        #   send {
+        #     "request_id":"prefill_request_id",
+        #     "remote_block_ids":"prefill_block_ids",
+        #     "remote_engine_id":"prefill_engine_id",
+        #     "remote_host":"prefill_host",
+        #     "remote_port":prefill_start_port
+        #     "remote_dp_rank":prefill_dp_rank,
+        #     "remote_tp_size":prefill_tp_size,
+        #   } to Meta Server
+
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
                       attn_metadata: "AttentionMetadata", **kwargs) -> None:
         """MooncakeConnector does not save explicitly."""
-        #TODO layerwise step4
-        # prefiler send request info to Meta Server
-        # if is first layer:
-        #   for request in self._connector_metadata:
-        #   send {
-        #   "request_id":"prefill_request_id",
-        #   "remote_block_ids":"prefill_block_ids",
-        #   "remote_engine_id":"prefill_engine_id",
-        #   "remote_host":"prefill_host",
-        #   "remote_port":prefill_start_port
-        #   "remote_dp_rank":prefill_dp_rank,
-        #    "remote_tp_size":prefill_tp_size,
-        #   } to Meta Server
         #TODO layerwise step8
         # ansyc send kv layer
         # self.kv_send_layer_thread.add_request(  # type: ignore[union-attr]
@@ -1085,22 +1100,6 @@ class MooncakeConnectorWorker:
         pass
     
     def wait_for_layer_load(self, layer_name: str) -> None:
-        #TODO layerwise step7
-        # decoder send request info to prefiller
-        # if is first layer:
-        #   for request in self._connector_metadata:
-        #   send {
-        #   "request_id":"decode_request_id",
-        #   "remote_block_ids":"decode_block_ids",
-        #   "remote_engine_id":"decode_engine_id",
-        #   "remote_host":"decode_host",
-        #   "remote_port":decode_start_port
-        #   "remote_dp_rank":decode_dp_rank,
-        #   "remote_tp_size":decode_tp_size,
-        #   "te_rpc_port": "decode_rpc_port"
-        #   "kv_caches_base_addr": "decode_kv_caches_base_addr"
-        #   "num_blocks": "decode_num_blocks"
-        #   } to prefiller connector worker listen port (prefill_remote_port + prefill_dp_rank * prefill_tp_size + decode_tp_rank)
         pass
     
     def _get_remote_tp_rank(self, req_id: str) -> int:
