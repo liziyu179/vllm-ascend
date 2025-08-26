@@ -12,13 +12,15 @@ from collections import defaultdict, deque
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import msgspec
 import numpy as np
 import numpy.typing as npt
 import torch
 import zmq
+import httpx
+import asyncio
 from mooncake.engine import TransferEngine  # type: ignore
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -37,6 +39,7 @@ if TYPE_CHECKING:
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
+DECODER_TP_HELLO = b"decoder_tp_hello"
 
 
 class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
@@ -53,6 +56,16 @@ class ReqMeta:
     remote_host: str
     remote_port: int
     remote_engine_id: str
+
+@dataclass
+class LayerSendingState:
+    local_block_ids: list[int]
+    metaserver_notified: bool
+    sent_layers: Optional[int]
+    remote_block_ids: Optional[list[int]]
+    remote_host: Optional[str]
+    remote_port: Optional[int]
+    remote_engine_id: Optional[str]
 
 
 class KVCacheTaskTracker:
@@ -238,7 +251,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                  metadata: MooncakeAgentMetadata,
                  ready_event: threading.Event):
         super().__init__(daemon=True, name="KVCacheSendingLayerThread")
-        self.decode_request = dict({req_id: ReqMeta})
+        self.decode_request = dict[str, ReqMeta]()
         self.send_layer_thread = SendingLayerThread(self.task_tracker)  # TODO layerwise step8
         self.task_tracker = KVCacheTaskTracker(self.tp_rank,
                                                self.local_engine_id,
@@ -580,6 +593,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
 
     def __init__(self):
         self.requests: dict[str, ReqMeta] = {}
+        self.states: dict[str, LayerSendingState] = {}
 
     def add_new_req(
         self,
@@ -597,6 +611,17 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             remote_tp_size = kv_transfer_params["remote_tp_size"],
         )
 
+    def add_new_state(self, request_id: str, blocks: list[int]):
+        self.states[request_id] = LayerSendingState(
+            local_block_ids=blocks,
+            metaserver_notified=False,
+            sent_layers=None,
+            remote_block_ids=None,
+            remote_engine_id=None,
+            remote_host=None,
+            remote_port=None,
+        )
+
 
 class MooncakeConnector(KVConnectorBase_V1):
 
@@ -604,14 +629,20 @@ class MooncakeConnector(KVConnectorBase_V1):
         assert vllm_config.kv_transfer_config is not None
         self.engine_id = vllm_config.kv_transfer_config.engine_id
 
+        # TODO get them from config
+        self.layer_wise = True
+        self.total_layers = 72
+        self.metaserver_path = "http://localhost:8000/metaserver"
+
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: Optional[MooncakeConnectorScheduler] = \
-                MooncakeConnectorScheduler(vllm_config, str(self.engine_id))
+                MooncakeConnectorScheduler(vllm_config, str(self.engine_id), self.layer_wise)
             self.connector_worker: Optional[MooncakeConnectorWorker] = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
             self.connector_worker = MooncakeConnectorWorker(
-                vllm_config, str(self.engine_id))
+                vllm_config, str(self.engine_id), self.layer_wise)
+
 
     ############################################################
     # Scheduler Side Methods
@@ -686,10 +717,11 @@ class MooncakeConnector(KVConnectorBase_V1):
 class MooncakeConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
-    def __init__(self, vllm_config: VllmConfig, engine_id: str):
+    def __init__(self, vllm_config: VllmConfig, engine_id: str, layer_wise: bool):
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
         self.engine_id = engine_id
+        self.layer_wise = layer_wise
         logger.info("Initializing Mooncake Scheduler %s", engine_id)
 
         self.side_channel_host = get_ip()
@@ -706,6 +738,7 @@ class MooncakeConnectorScheduler:
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[str, tuple[Request, list[int]]] = {}
+        self._reqs_need_send: set[str] = set()
 
     def get_num_new_matched_tokens(
             self, request: "Request",
@@ -771,6 +804,9 @@ class MooncakeConnectorScheduler:
             # Only trigger 1 KV transfer per request.
             params["do_remote_prefill"] = False
 
+        if self.layer_wise and params is not None and params.get("do_remote_decode"):
+            self._reqs_need_send.add(request.request_id)
+
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
@@ -791,6 +827,13 @@ class MooncakeConnectorScheduler:
 
         # Clear the list once workers start the transfers
         self._reqs_need_recv.clear()
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            request_id = new_req.req_id
+            if request_id in self._reqs_need_send:
+                local_block_ids = new_req.block_ids
+                meta.add_new_state(request_id, local_block_ids)
+                self._reqs_need_send.remove(request_id)
 
         return meta
 
@@ -831,7 +874,7 @@ class MooncakeConnectorScheduler:
 class MooncakeConnectorWorker:
     """Implementation of Worker side methods"""
 
-    def __init__(self, vllm_config: VllmConfig, engine_id: str):
+    def __init__(self, vllm_config: VllmConfig, engine_id: str, metaserver_path: str, layer_wise: bool):
         self._get_prefill_decode_size(vllm_config)
         if self._prefill_tp_size < self._decode_tp_size:
             raise ValueError(
@@ -854,6 +897,9 @@ class MooncakeConnectorWorker:
         self.side_channel_host = get_ip()
         self.max_device_id = self.tp_size * self.dp_size
         self.kv_role = vllm_config.kv_transfer_config.kv_role
+        self.layer_wise = layer_wise
+
+        self.metaserver_client = httpx.AsyncClient(limits=httpx.Limits(max_connections=1000), base_url=metaserver_path) if self.tp_rank == 0 else None
 
         # Handshake base port
         self.side_channel_port = (
@@ -1073,6 +1119,7 @@ class MooncakeConnectorWorker:
         #     "kv_caches_base_addr": "decode_kv_caches_base_addr"
         #     "num_blocks": "decode_num_blocks"
         #   } to prefiller connector worker listen port (prefill_remote_port + prefill_dp_rank * prefill_tp_size + decode_tp_rank)
+
         # for request in self._connector_metadata:
         # TODO layerwise step4
         # prefiler send request info to Meta Server
@@ -1085,6 +1132,18 @@ class MooncakeConnectorWorker:
         #     "remote_dp_rank":prefill_dp_rank,
         #     "remote_tp_size":prefill_tp_size,
         #   } to Meta Server
+        metaserver_message = []
+        for req_id, sending_state in metadata.states.items():
+            metaserver_message.append({
+                "remote_engine_id": self.engine_id,
+                "request_id": req_id,
+                "dp_rank": self.dp_rank,
+                "remote_host": self.side_channel_host,
+                "port": self.side_channel_port
+            })
+            sending_state.metaserver_notified = True
+        if metaserver_message and self.tp_rank == 0:
+            asyncio.create_task(self.metaserver_client.post('/metaserver', json=metaserver_message))
 
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
