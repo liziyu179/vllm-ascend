@@ -679,14 +679,13 @@ class KVCacheRecvingThread(threading.Thread):
 
 class KVCacheRecvingLayerThread(threading.Thread):
 
-    def __init__(self, tp_rank: int, tp_size: int, engine: TransferEngine,
-                 local_engine_id: str, local_handshake_port: int,
-                 local_kv_caches_base_addr: list[int], block_len: list[int],
-                 ready_event: threading.Event):
+    def __init__(self, tp_rank: int, side_channel_port: int):
         super().__init__(daemon=True, name="KVCacheRecvingLayerThread")
         self.task_tracker = KVCacheTaskTracker(self.tp_rank,
                                                self.local_engine_id,
                                                self.tp_size)
+        self.tp_rank = tp_rank
+        self.side_channel_port = side_channel_port
 
 
     def get_and_clear_finished_requests(self) -> set[str]:
@@ -703,6 +702,42 @@ class KVCacheRecvingLayerThread(threading.Thread):
         # with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore
         #    while True:
         #       recv_msg from prefill request send finish
+        encoder = msgspec.msgpack.Encoder()
+        encoded_data = encoder.encode(self.metadata)
+        size_in_bytes = len(encoded_data)
+        logger.debug("Size of encoded MooncakeAgentMetadata: %s bytes",
+                     str(size_in_bytes))
+
+        # Listen for new requests for metadata.
+        # NOTE(rob): we need each rank to have a unique port. This hack to keeps
+        # us moving. We will switch when moving to etcd or where we have a
+        # single ZMQ socket in the scheduler.
+        handshake_port = self.side_channel_port + self.tp_rank
+        path = make_zmq_path("tcp", self.side_channel_host, handshake_port)
+        logger.info("Starting listening on path: %s", path)
+        with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore
+            self.ready_event.set()
+            decoder = msgspec.msgpack.Decoder(type=tuple)
+            while True:
+                try:
+                    frames = sock.recv_multipart()
+                    if len(frames) < 2:
+                        logger.error("Invalid message format: %s", frames)
+                        continue
+
+                    identity = frames[0]
+                    payload = [f for f in frames[1:] if f != b""]
+                    if len(payload) != 1:
+                        logger.error("Invalid message format: %s", frames)
+                        continue
+
+                    msg = decoder.decode(payload[0])
+                    if msg[0] == PREFILLER_TP_BYE:
+                        request_id = msg[1]
+                        self.task_tracker.mark_request_finished(request_id)
+                        sock.send_multipart((identity, b"", b"ACK"))
+                except Exception as e:
+                    logger.error("Failed to decode message: %s", e)
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -1167,16 +1202,17 @@ class MooncakeConnectorWorker:
                 self.kv_send_layer_thread.start()
                 self.kv_send_thread = None
         else:
-            self.kv_recv_thread = KVCacheRecvingThread(
-                self.tp_rank, self.tp_size, self.engine, self.engine_id,
-                self.handshake_port, kv_caches_base_addr, self.block_len,
-                ready_event)
-            self.kv_recv_thread.start()
-            self.kv_recv_layer_thread = KVCacheRecvingLayerThread(
-                self.tp_rank, self.tp_size, self.engine, self.engine_id,
-                self.handshake_port, kv_caches_base_addr, self.block_len,
-                ready_event)
-            self.kv_recv_layer_thread.start()
+            if self.layer_wise:
+                self.kv_recv_thread = KVCacheRecvingThread(
+                    self.tp_rank, self.tp_size, self.engine, self.engine_id,
+                    self.handshake_port, kv_caches_base_addr, self.block_len,
+                    ready_event)
+                self.kv_recv_thread.start()
+                self.kv_recv_layer_thread = None
+            else:
+                self.kv_recv_layer_thread = KVCacheRecvingLayerThread(self.tp_rank, self.side_channel_port)
+                self.kv_recv_layer_thread.start()
+                self.kv_recv_thread = None
         ready_event.wait()
 
     def _register(self, ptr, length):
@@ -1239,6 +1275,7 @@ class MooncakeConnectorWorker:
         #     "kv_caches_base_addr": "decode_kv_caches_base_addr"
         #     "num_blocks": "decode_num_blocks"
         #   } to prefiller connector worker listen port (prefill_remote_port + prefill_dp_rank * prefill_tp_size + decode_tp_rank)
+
 
         # for request in self._connector_metadata:
         # TODO layerwise step4
