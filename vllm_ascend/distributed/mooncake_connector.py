@@ -69,7 +69,7 @@ class DecoderMeta(msgspec.Struct, omit_defaults=True, dict=True):
 @dataclass
 class LayerSendingState:
     local_block_ids: list[int]
-    metaserver_notified: bool
+    metaserver: str
 
 
 class KVCacheTaskTracker:
@@ -715,10 +715,10 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             remote_tp_size = kv_transfer_params["remote_tp_size"],
         )
 
-    def add_new_state(self, request_id: str, blocks: list[int]):
+    def add_new_state(self, request_id: str, blocks: list[int], metaserver: str):
         self.states[request_id] = LayerSendingState(
             local_block_ids=blocks,
-            metaserver_notified=False
+            metaserver=metaserver
         )
 
 
@@ -837,7 +837,7 @@ class MooncakeConnectorScheduler:
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[str, tuple[Request, list[int]]] = {}
-        self._reqs_need_send: set[str] = set()
+        self._reqs_need_send: dict[str, str] = {}
 
     def get_num_new_matched_tokens(
             self, request: "Request",
@@ -904,7 +904,7 @@ class MooncakeConnectorScheduler:
             params["do_remote_prefill"] = False
 
         if self.layer_wise and params is not None and params.get("do_remote_decode"):
-            self._reqs_need_send.add(request.request_id)
+            self._reqs_need_send[request.request_id] = params.get("metaserver")
 
     def build_connector_meta(
         self,
@@ -931,8 +931,7 @@ class MooncakeConnectorScheduler:
             request_id = new_req.req_id
             if request_id in self._reqs_need_send:
                 local_block_ids = new_req.block_ids
-                meta.add_new_state(request_id, local_block_ids)
-                self._reqs_need_send.remove(request_id)
+                meta.add_new_state(request_id, local_block_ids, self._reqs_need_send.pop(request_id))
 
         return meta
 
@@ -999,7 +998,7 @@ class MooncakeConnectorWorker:
         self.layer_wise = layer_wise
         self.total_layers = total_layers
 
-        self.metaserver_client = httpx.AsyncClient(limits=httpx.Limits(max_connections=1000), base_url=metaserver_path) if self.tp_rank == 0 else None
+        self.metaserver_client = httpx.AsyncClient(limits=httpx.Limits(max_connections=1000)) if self.tp_rank == 0 else None
 
         # Handshake base port
         self.side_channel_port = (
@@ -1241,10 +1240,10 @@ class MooncakeConnectorWorker:
         #     "remote_dp_rank":prefill_dp_rank,
         #     "remote_tp_size":prefill_tp_size,
         #   } to Meta Server
-        metaserver_message = []
+        metaserver_message = dict()
         for req_id, sending_state in metadata.states.items():
             if not sending_state.metaserver_notified:
-                metaserver_message.append({
+                metaserver_message.setdefault(sending_state.metaserver, []).append({
                     "remote_engine_id": self.engine_id,
                     "request_id": req_id,
                     "dp_rank": self.dp_rank,
@@ -1252,9 +1251,9 @@ class MooncakeConnectorWorker:
                     "port": self.side_channel_port
                 })
                 sending_state.metaserver_notified = True
-        if metaserver_message and self.tp_rank == 0:
-            asyncio.create_task(self.metaserver_client.post('/metaserver', json=metaserver_message))
-
+        for metaserver, messages in metaserver_message.items():
+            if self.tp_rank == 0:
+                asyncio.create_task(self.metaserver_client.post(metaserver, json=messages))
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
                       attn_metadata: "AttentionMetadata", 
