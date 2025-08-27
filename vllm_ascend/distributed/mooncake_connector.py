@@ -58,6 +58,15 @@ class ReqMeta:
     remote_engine_id: str
 
 @dataclass
+class DecoderMeta(msgspec.Struct, omit_defaults=True, dict=True):
+    remote_host: str
+    remote_engine_id: str
+    remote_te_port: int
+    remote_handshake_port: int
+    remote_kv_base_addr: list[int]
+    remote_block_ids: list[int]
+
+@dataclass
 class LayerSendingState:
     local_block_ids: list[int]
     metaserver_notified: bool
@@ -245,18 +254,22 @@ class KVCacheSendingLayerThread(threading.Thread):
                  side_channel_host: str, side_channel_port: int,
                  metadata: MooncakeAgentMetadata,
                  ready_event: threading.Event,
-                 total_layers: int):
+                 total_layers: int,
+                 engine: TransferEngine,
+                 local_kv_base_addr: list[str],
+                 block_len: list[int],
+                 use_mla: bool):
         super().__init__(daemon=True, name="KVCacheSendingLayerThread")
         self.tp_rank = tp_rank
         self.decode_tp_size = decode_tp_size
         self.local_engine_id = local_engine_id
         self.side_channel_host = side_channel_host
         self.side_channel_port = side_channel_port
-        self.send_layer_thread = SendingLayerThread(self.task_tracker)  # TODO layerwise step8
+        self.send_layer_thread = SendingLayerThread(self.task_tracker, engine, local_kv_base_addr, block_len, use_mla)  # TODO layerwise step8
         self.task_tracker = KVCacheTaskTracker(self.tp_rank,
                                                self.local_engine_id,
                                                self.decode_tp_size)
-        self.ready_decode = dict[str, ReqMeta]()
+        self.ready_decode = dict[str, DecoderMeta]()
         self.pending_decode = dict[str, list[tuple[str, list[int], int]]]()
         self.total_layers = total_layers
 
@@ -309,61 +322,56 @@ class KVCacheSendingLayerThread(threading.Thread):
                     msg = decoder.decode(payload[0])
                     if msg[0] == DECODER_TP_HELLO:
                         request_id = msg[1]
-                        remote_host = msg[2]
-                        remote_port = msg[3]
-                        remote_engine_id = msg[4]
-                        self.ready_decode[request_id] = ReqMeta(
-                            local_block_ids=[],
-                            request_id=request_id,
-                            remote_host=remote_host,
-                            remote_port=remote_port,
-                            remote_engine_id=remote_engine_id
-                        )
+                        self.ready_decode[request_id] = msg[2]
                         sock.send_multipart((identity, b"", b"ACK"))
                         for layer_name, local_block_ids, layer_index in self.pending_decode.pop(request_id, []):
-                            self.send_layer_thread.send_queue.add((self.ready_decode[request_id], layer_name, local_block_ids, layer_index))
+                            self.send_layer_thread.send_queue.add((self.ready_decode[request_id], request_id, layer_name, local_block_ids, layer_index))
                 except Exception as e:
                     logger.error("Failed to decode message: %s", e)
 
-        
-    def add_request(self, request_id, layer_name, local_block_ids, layer_index):
+
+    def add_request(self, request_id: str, layer_name: str, local_block_ids: list[int], layer_index: int):
         #TODO layerwise step 8
         # if request_id in self.decode_request:
         #   self.send_layer_thread.send_queue.add(request)
         if request_id in self.ready_decode:
-            self.send_layer_thread.send_queue.add((self.ready_decode[request_id], layer_name, local_block_ids, layer_index))
-            if layer_index == self.total_layers - 1:
-                self.ready_decode.pop(request_id)
+            self.send_layer_thread.send_queue.add((self.ready_decode[request_id], request_id, layer_name, local_block_ids, layer_index))
         else:
             self.pending_decode.setdefault(request_id, []).append((layer_name, local_block_ids, layer_index))
 
 class SendingLayerThread(threading.Thread):
 
-    def __init__(self, task_tracker, port: int, finished: KVCacheTaskTracker, total_layers: int):
+    def __init__(self, task_tracker, port: int, finished: KVCacheTaskTracker, total_layers: int, engine: TransferEngine, local_kv_base_addr: list[str], block_len: list[int], use_mla: bool):
         super().__init__(daemon=True, name="KVCacheRecvingPrefillerByeThread")
-        self.send_queue = queue()
+        self.send_queue = queue[tuple[DecoderMeta, str, str, list[int], int]]()
         self.task_tracker = task_tracker
         self.total_layers = total_layers
+        self.port = port
+        self.local_kv_base_addr = local_kv_base_addr
+        self.block_len = block_len
+        self.use_mla = use_mla
+        self.engine = engine
 
     def run(self):
         """Run the thread to handle KV cache receiving for prefiller bye messages."""
-       #TODO layerwise step8
-       # send kv cache for request in send_queue
-       # while True:
-       #    get requeset form send_queue and send to decoder
-       #    _handle_request(self, req_meta: dict[str, Any]):
-    
-    def _handle_request(self, req_meta: dict[str, Any]):
+        #TODO layerwise step8
+        # send kv cache for request in send_queue
+        # while True:
+        #    get requeset form send_queue and send to decoder
+        #    _handle_request(self, req_meta: dict[str, Any]):
+        while True:
+            request = self.send_queue.get()
+            self._handle_request(request)
+
+    def _handle_request(self, request: tuple[DecoderMeta, str, str, list[int], int]):
         #TODO layerwise step8
         # send kv layer to remote
-        request_id = req_meta["request_id"]
-        remote_host = req_meta["remote_host"]
-        remote_handshake_port = req_meta["remote_handshake_port"]
+        req_meta, request_id, layer_name, local_block_ids, layer_index = request
 
         try:
             logger.debug(
                 f"Starting to transfer KV cache for request {request_id}.")
-            self._transfer_kv_cache(req_meta)
+            self._transfer_kv_cache(req_meta, request_id, layer_name, local_block_ids, layer_index)
             logger.debug(
                 f"Finished transferring KV cache for request {request_id}.")
         except Exception as e:
@@ -373,6 +381,44 @@ class SendingLayerThread(threading.Thread):
             self.task_tracker.update_done_task_count(request_id, self.tp_rank)
             self.send_queue.task_done()
 
+    def _transfer_kv_cache(self, req_meta: DecoderMeta, request_id: str, layer_name: str, local_block_ids: list[int], layer_index: int):
+        #TODO layerwise step8
+        # send kv layer to remote
+        if len(local_block_ids) == 0:
+            return
+
+        remote_host = req_meta.remote_host
+        remote_te_port = req_meta.remote_te_port
+        remote_handshake_port = req_meta.remote_handshake_port
+        remote_kv_base_addrs = req_meta.remote_kv_base_addr
+
+        layer_size = len(local_block_ids) / self.total_layers
+        layer_local_block_ids = local_block_ids[layer_index * layer_size:(layer_index + 1) * layer_size]
+        layer_remote_block_ids = req_meta.remote_block_ids[layer_index * layer_size:(layer_index + 1) * layer_size]
+
+        grouped_remote_block_ids, grouped_local_block_ids = \
+            group_concurrent_contiguous(layer_remote_block_ids, layer_local_block_ids)
+
+        session_id = f"{remote_host}:{remote_te_port}"
+        src_list, dst_list, length_list = [], [], []
+        for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(zip(self.local_kv_base_addr, remote_kv_base_addrs)):
+            block_len = self.block_len[k % 2] if self.use_mla else self.block_len[0]
+            for group_remote_block_id, group_local_block_id in zip(grouped_remote_block_ids, grouped_local_block_ids):
+                src = src_layer_base_addr + group_local_block_id[0] * block_len
+                dst = dst_layer_base_addr + group_remote_block_id[0] * block_len
+                length = len(local_block_ids) * block_len
+                src_list.append(src)
+                dst_list.append(dst)
+                length_list.append(length)
+        ret = self.engine.batch_transfer_sync_write(session_id, src_list, dst_list, length_list)
+
+        if ret < 0:
+            logger.error("Mooncake transfer failed for request %s",
+                         req_meta["request_id"])
+            raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
+
+        if layer_index == self.total_layers - 1:
+            self.task_tracker.mark_task_done(request_id)
 
 class KVCacheRecvingThread(threading.Thread):
 
@@ -1104,7 +1150,9 @@ class MooncakeConnectorWorker:
                                                         self.engine_id,
                                                         self.side_channel_host,
                                                         self.side_channel_port,
-                                                        metadata, ready_event, self.total_layers)
+                                                        metadata, ready_event, self.total_layers,
+                                                        self.engine, kv_caches_base_addr,
+                                                        self.block_len, self.use_mla)
                 self.kv_send_layer_thread.start()
                 self.kv_send_thread = None
         else:
@@ -1224,7 +1272,7 @@ class MooncakeConnectorWorker:
 
         requests = connector_metadata.states.items()
         for req_id, sending_state in requests:
-            self.kv_send_layer_thread.add_request(  # type: ignore[union-attr]
+            self.kv_send_layer_thread.add_request(
                 request_id=req_id,
                 layer_name=layer_name,
                 local_block_ids=sending_state.local_block_ids,
