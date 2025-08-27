@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
 DECODER_TP_HELLO = b"decoder_tp_hello"
+PREFILLER_TP_BYE = b"prefiller_tp_bye"
 
 
 class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
@@ -69,7 +70,7 @@ class DecoderMeta(msgspec.Struct, omit_defaults=True, dict=True):
 @dataclass
 class LayerSendingState:
     local_block_ids: list[int]
-    metaserver: str
+    metaserver: Optional[str]
 
 
 class KVCacheTaskTracker:
@@ -279,7 +280,18 @@ class KVCacheSendingLayerThread(threading.Thread):
         Returns:
             A set of request IDs that have been completed.
         """
-        return self.task_tracker.get_and_clear_finished_requests()
+        finished_request = self.task_tracker.get_and_clear_finished_requests()
+        for request_id in finished_request:
+            decoder_meta = self.ready_decode.pop(request_id)
+            url = f"tcp://{decoder_meta.remote_host}:{decoder_meta.remote_handshake_port}"
+            msg_encoder = msgspec.msgpack.Encoder()
+            encoded_data = msg_encoder.encode([PREFILLER_TP_BYE, request_id])
+            with zmq_ctx(zmq.REQ, url) as sock:
+                ensure_zmq_send(sock, encoded_data)
+                ack = ensure_zmq_recv(sock)
+                if ack != b"ACK":
+                    raise ValueError(f"Unexpected ACK response: {ack}")
+        return finished_request
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -1242,7 +1254,7 @@ class MooncakeConnectorWorker:
         #   } to Meta Server
         metaserver_message = dict()
         for req_id, sending_state in metadata.states.items():
-            if not sending_state.metaserver_notified:
+            if sending_state.metaserver:
                 metaserver_message.setdefault(sending_state.metaserver, []).append({
                     "remote_engine_id": self.engine_id,
                     "request_id": req_id,
@@ -1250,7 +1262,7 @@ class MooncakeConnectorWorker:
                     "remote_host": self.side_channel_host,
                     "port": self.side_channel_port
                 })
-                sending_state.metaserver_notified = True
+                sending_state.metaserver = None
         for metaserver, messages in metaserver_message.items():
             if self.tp_rank == 0:
                 asyncio.create_task(self.metaserver_client.post(metaserver, json=messages))
