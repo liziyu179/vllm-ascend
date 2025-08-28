@@ -776,13 +776,13 @@ class MooncakeConnector(KVConnectorBase_V1):
         self.engine_id = vllm_config.kv_transfer_config.engine_id
 
         # TODO get them from config
-        self.layer_wise = True
-        self.total_layers = 72
-        self.metaserver_path = "http://localhost:8000/metaserver"
+        self.layer_wise = vllm_config.kv_transfer_config.get_from_extra_config("layer_wise", False)
+        self.total_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+        self.metaserver_path = vllm_config.kv_transfer_config.get_from_extra_config("metaserver_path", "http://localhost:8000/prefillinfo")
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: Optional[MooncakeConnectorScheduler] = \
-                MooncakeConnectorScheduler(vllm_config, str(self.engine_id), self.layer_wise)
+                MooncakeConnectorScheduler(vllm_config, str(self.engine_id), self.layer_wise, self.metaserver_path)
             self.connector_worker: Optional[MooncakeConnectorWorker] = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
@@ -863,7 +863,7 @@ class MooncakeConnector(KVConnectorBase_V1):
 class MooncakeConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
-    def __init__(self, vllm_config: VllmConfig, engine_id: str, layer_wise: bool):
+    def __init__(self, vllm_config: VllmConfig, engine_id: str, layer_wise: bool, metaserver_path: str):
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
         self.engine_id = engine_id
@@ -873,6 +873,7 @@ class MooncakeConnectorScheduler:
         self.side_channel_host = get_ip()
         self.max_device_id = vllm_config.parallel_config.tensor_parallel_size * \
                              vllm_config.parallel_config.data_parallel_size
+        self.metaserver_path = metaserver_path
 
         # Handshake base port
         self.side_channel_port = (
@@ -951,7 +952,7 @@ class MooncakeConnectorScheduler:
             params["do_remote_prefill"] = False
 
         if self.layer_wise and params is not None and params.get("do_remote_decode"):
-            self._reqs_need_send[request.request_id] = params.get("metaserver")
+            self._reqs_need_send[request.request_id] = params.get("metaserver", self.metaserver_path)
 
     def build_connector_meta(
         self,
@@ -1019,7 +1020,7 @@ class MooncakeConnectorScheduler:
 class MooncakeConnectorWorker:
     """Implementation of Worker side methods"""
 
-    def __init__(self, vllm_config: VllmConfig, engine_id: str, metaserver_path: str, layer_wise: bool, total_layers: int):
+    def __init__(self, vllm_config: VllmConfig, engine_id: str, layer_wise: bool, total_layers: int):
         self._get_prefill_decode_size(vllm_config)
         if self._prefill_tp_size < self._decode_tp_size:
             raise ValueError(
@@ -1302,8 +1303,8 @@ class MooncakeConnectorWorker:
                     "request_id": req_id,
                     "kv_transfer_params": kv_transfer_params
                 }
+                asyncio.run(self.metaserver_client.post(sending_state.metaserver, json=message))
                 sending_state.metaserver = None
-                asyncio.run(self.metaserver_client.post(self.metaserver_path, json=message))
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
                       attn_metadata: "AttentionMetadata", 
