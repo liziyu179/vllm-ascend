@@ -1289,20 +1289,21 @@ class MooncakeConnectorWorker:
         #     "remote_dp_rank":prefill_dp_rank,
         #     "remote_tp_size":prefill_tp_size,
         #   } to Meta Server
-        metaserver_message = dict()
         for req_id, sending_state in metadata.states.items():
             if sending_state.metaserver:
-                metaserver_message.setdefault(sending_state.metaserver, []).append({
+                kv_transfer_params = {
                     "remote_engine_id": self.engine_id,
                     "request_id": req_id,
                     "dp_rank": self.dp_rank,
                     "remote_host": self.side_channel_host,
-                    "port": self.side_channel_port
-                })
+                    "remote_port": self.side_channel_port
+                }
+                message = {
+                    "request_id": req_id,
+                    "kv_transfer_params": kv_transfer_params
+                }
                 sending_state.metaserver = None
-        for metaserver, messages in metaserver_message.items():
-            if self.tp_rank == 0:
-                asyncio.create_task(self.metaserver_client.post(metaserver, json=messages))
+                asyncio.run(self.metaserver_client.post(self.metaserver_path, json=message))
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
                       attn_metadata: "AttentionMetadata", 
