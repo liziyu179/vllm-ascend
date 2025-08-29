@@ -74,7 +74,7 @@ class DecodeMooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True)
 
 class KVCacheTaskTracker:
 
-    def __init__(self, tp_rank: int, local_engine_id: str, target_count: int, callback: Callable[[str], None]):
+    def __init__(self, tp_rank: int, local_engine_id: str, target_count: int, callback: Callable[[str], None] = lambda x: None):
         super().__init__()
         self.tp_rank = tp_rank
         self.local_engine_id = local_engine_id
