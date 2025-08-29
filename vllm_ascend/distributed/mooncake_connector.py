@@ -318,7 +318,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                         continue
 
                     metadata = decoder.decode(payload[0])
-                    request_id = metadata.request_id
+                    request_id = metadata.req_id
                     sock.send_multipart((identity, b"", b"ACK"))
                     with self.lock:
                         self.ready_decode[request_id] = metadata
@@ -327,7 +327,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                 except Exception as e:
                     logger.error("Failed to decode message: %s", e)
 
-    def _post_transfer(self, request_id):
+    def _post_transfer(self, request_id: str):
         with self.lock:
             decoder_meta = self.ready_decode.pop(request_id)
             path = make_zmq_path("tcp", decoder_meta.remote_host, decoder_meta.remote_handshake_port)
