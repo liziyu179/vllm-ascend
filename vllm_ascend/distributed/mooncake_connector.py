@@ -399,14 +399,14 @@ class SendingLayerThread(threading.Thread):
         if len(local_block_ids) == 0:
             return
 
-        remote_host = req_meta.remote_host
-        remote_te_port = req_meta.remote_te_port
-        remote_handshake_port = req_meta.remote_handshake_port
-        remote_kv_base_addrs = req_meta.remote_kv_base_addr
+        remote_host = req_meta.host
+        remote_te_port = req_meta.te_rpc_port
+        remote_handshake_port = req_meta.port
+        remote_kv_base_addrs = req_meta.kv_caches_base_addr
 
         layer_size = len(local_block_ids) / self.total_layers
         layer_local_block_ids = local_block_ids[layer_index * layer_size:(layer_index + 1) * layer_size]
-        layer_remote_block_ids = req_meta.remote_block_ids[layer_index * layer_size:(layer_index + 1) * layer_size]
+        layer_remote_block_ids = req_meta.block_ids[layer_index * layer_size:(layer_index + 1) * layer_size]
 
         grouped_remote_block_ids, grouped_local_block_ids = \
             group_concurrent_contiguous(layer_remote_block_ids, layer_local_block_ids)
