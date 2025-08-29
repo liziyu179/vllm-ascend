@@ -298,7 +298,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         """Run the thread to handle KV cache transfer requests."""
 
         #TODO layerwise step7
-        # self.send_layer_thread.start()
+        self.send_layer_thread.start()
         # with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore
         #    while True:
         #       recv_msg from decode and add to self.decode_request
