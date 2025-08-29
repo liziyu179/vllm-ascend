@@ -272,6 +272,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.ready_decode = dict[str, DecodeMooncakeAgentMetadata]()
         self.pending_decode = dict[str, list[tuple[str, list[int], int]]]()
         self.total_layers = total_layers
+        self.lock = threading.Lock()
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """
@@ -329,8 +330,9 @@ class KVCacheSendingLayerThread(threading.Thread):
                         request_id = msg[1]
                         self.ready_decode[request_id] = msg[2]
                         sock.send_multipart((identity, b"", b"ACK"))
-                        for layer_name, local_block_ids, layer_index in self.pending_decode.pop(request_id, []):
-                            self.send_layer_thread.send_queue.add((self.ready_decode[request_id], request_id, layer_name, local_block_ids, layer_index))
+                        with self.lock:
+                            for layer_name, local_block_ids, layer_index in self.pending_decode.pop(request_id, []):
+                                self.send_layer_thread.send_queue.add((self.ready_decode[request_id], request_id, layer_name, local_block_ids, layer_index))
                 except Exception as e:
                     logger.error("Failed to decode message: %s", e)
 
@@ -339,10 +341,11 @@ class KVCacheSendingLayerThread(threading.Thread):
         #TODO layerwise step 8
         # if request_id in self.decode_request:
         #   self.send_layer_thread.send_queue.add(request)
-        if request_id in self.ready_decode:
-            self.send_layer_thread.send_queue.add((self.ready_decode[request_id], request_id, layer_name, local_block_ids, layer_index))
-        else:
-            self.pending_decode.setdefault(request_id, []).append((layer_name, local_block_ids, layer_index))
+        with self.lock:
+            if request_id in self.ready_decode:
+                self.send_layer_thread.send_queue.add((self.ready_decode[request_id], request_id, layer_name, local_block_ids, layer_index))
+            else:
+                self.pending_decode.setdefault(request_id, []).append((layer_name, local_block_ids, layer_index))
 
 class SendingLayerThread(threading.Thread):
 
