@@ -333,7 +333,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                         sock.send_multipart((identity, b"", b"ACK"))
                         with self.lock:
                             for layer_name, local_block_ids, layer_index in self.pending_decode.pop(request_id, []):
-                                self.send_layer_thread.send_queue.add((self.ready_decode[request_id], request_id, layer_name, local_block_ids, layer_index))
+                                self.send_layer_thread.send_queue.put((self.ready_decode[request_id], request_id, layer_name, local_block_ids, layer_index))
                 except Exception as e:
                     logger.error("Failed to decode message: %s", e)
 
@@ -344,7 +344,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         #   self.send_layer_thread.send_queue.add(request)
         with self.lock:
             if request_id in self.ready_decode:
-                self.send_layer_thread.send_queue.add((self.ready_decode[request_id], request_id, layer_name, local_block_ids, layer_index))
+                self.send_layer_thread.send_queue.put((self.ready_decode[request_id], request_id, layer_name, local_block_ids, layer_index))
             else:
                 self.pending_decode.setdefault(request_id, []).append((layer_name, local_block_ids, layer_index))
 
