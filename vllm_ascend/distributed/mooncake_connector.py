@@ -12,7 +12,7 @@ from collections import defaultdict, deque
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Callable
 
 import msgspec
 import numpy as np
@@ -39,8 +39,6 @@ if TYPE_CHECKING:
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
-DECODER_TP_HELLO = b"decoder_tp_hello"
-PREFILLER_TP_BYE = b"prefiller_tp_bye"
 
 
 class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
@@ -76,7 +74,7 @@ class DecodeMooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True)
 
 class KVCacheTaskTracker:
 
-    def __init__(self, tp_rank: int, local_engine_id: str, target_count: int):
+    def __init__(self, tp_rank: int, local_engine_id: str, target_count: int, callback: Callable[[str], None]):
         super().__init__()
         self.tp_rank = tp_rank
         self.local_engine_id = local_engine_id
@@ -85,6 +83,7 @@ class KVCacheTaskTracker:
         self.done_task_lock = threading.Lock()
         self.done_task_counts: defaultdict[str, set[int]] = defaultdict(set)
         self.finished_requests: set[str] = set()
+        self.callback = callback
 
         self.socket_path = \
             f"ipc:///tmp/vllm_mooncake_connector_{self.local_engine_id}.ipc"
@@ -144,6 +143,7 @@ class KVCacheTaskTracker:
                 logger.info("All transfers completed for request: "
                             f"{request_id}. Total ranks: "
                             f"{self.target_count}.")
+                self.callback(request_id)
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """
@@ -267,7 +267,8 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.side_channel_port = side_channel_port
         self.task_tracker = KVCacheTaskTracker(self.tp_rank,
                                                self.local_engine_id,
-                                               self.decode_tp_size)
+                                               self.decode_tp_size,
+                                               self._post_transfer)
         self.send_layer_thread = SendingLayerThread(self.task_tracker, total_layers, engine, local_kv_base_addr, block_len, use_mla, self.tp_rank)
         self.ready_decode = dict[str, DecodeMooncakeAgentMetadata]()
         self.pending_decode = dict[str, list[tuple[str, list[int], int]]]()
@@ -281,18 +282,8 @@ class KVCacheSendingLayerThread(threading.Thread):
         Returns:
             A set of request IDs that have been completed.
         """
-        finished_request = self.task_tracker.get_and_clear_finished_requests()
-        for request_id in finished_request:
-            decoder_meta = self.ready_decode.pop(request_id)
-            path = make_zmq_path("tcp", decoder_meta.remote_host, decoder_meta.remote_handshake_port)
-            msg_encoder = msgspec.msgpack.Encoder()
-            encoded_data = msg_encoder.encode([PREFILLER_TP_BYE, request_id])
-            with zmq_ctx(zmq.REQ, path) as sock:
-                ensure_zmq_send(sock, encoded_data)
-                ack = sock.recv()
-                if ack != b"ACK":
-                    raise ValueError(f"Unexpected ACK response: {ack}")
-        return finished_request
+        # vllm won't call us if all inference is done, so we can't do step 9 here
+        return self.task_tracker.get_and_clear_finished_requests()
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -312,7 +303,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         logger.info("Starting listening on path: %s", path)
         with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore
             self.ready_event.set()
-            decoder = msgspec.msgpack.Decoder(type=tuple)
+            decoder = msgspec.msgpack.Decoder(type=DecodeMooncakeAgentMetadata)
             while True:
                 try:
                     frames = sock.recv_multipart()
@@ -326,16 +317,27 @@ class KVCacheSendingLayerThread(threading.Thread):
                         logger.error("Invalid message format: %s", frames)
                         continue
 
-                    msg = decoder.decode(payload[0])
-                    if msg[0] == DECODER_TP_HELLO:
-                        request_id = msg[1]
-                        self.ready_decode[request_id] = msg[2]
-                        sock.send_multipart((identity, b"", b"ACK"))
-                        with self.lock:
-                            for layer_name, local_block_ids, layer_index in self.pending_decode.pop(request_id, []):
-                                self.send_layer_thread.send_queue.put((self.ready_decode[request_id], request_id, layer_name, local_block_ids, layer_index))
+                    metadata = decoder.decode(payload[0])
+                    request_id = metadata.request_id
+                    sock.send_multipart((identity, b"", b"ACK"))
+                    with self.lock:
+                        self.ready_decode[request_id] = metadata
+                        for layer_name, local_block_ids, layer_index in self.pending_decode.pop(request_id, []):
+                            self.send_layer_thread.send_queue.put((self.ready_decode[request_id], request_id, layer_name, local_block_ids, layer_index))
                 except Exception as e:
                     logger.error("Failed to decode message: %s", e)
+
+    def _post_transfer(self, request_id):
+        with self.lock:
+            decoder_meta = self.ready_decode.pop(request_id)
+            path = make_zmq_path("tcp", decoder_meta.remote_host, decoder_meta.remote_handshake_port)
+            msg_encoder = msgspec.msgpack.Encoder()
+            encoded_data = msg_encoder.encode(request_id)
+            with zmq_ctx(zmq.REQ, path) as sock:
+                ensure_zmq_send(sock, encoded_data)
+                ack = sock.recv()
+                if ack != b"ACK":
+                    raise ValueError(f"Unexpected ACK response: {ack}")
 
 
     def add_request(self, request_id: str, layer_name: str, local_block_ids: list[int], layer_index: int):
@@ -380,7 +382,7 @@ class SendingLayerThread(threading.Thread):
         try:
             logger.debug(
                 f"Starting to transfer KV cache for request {request_id}.")
-            self._transfer_kv_cache(req_meta, request_id, layer_name, local_block_ids, layer_index)
+            self._transfer_kv_cache(req_meta, local_block_ids, layer_index)
             logger.debug(
                 f"Finished transferring KV cache for request {request_id}.")
         except Exception as e:
@@ -391,7 +393,7 @@ class SendingLayerThread(threading.Thread):
                 self.task_tracker.update_done_task_count(request_id, self.tp_rank)
             self.send_queue.task_done()
 
-    def _transfer_kv_cache(self, req_meta: DecodeMooncakeAgentMetadata, request_id: str, layer_name: str, local_block_ids: list[int], layer_index: int):
+    def _transfer_kv_cache(self, req_meta: DecodeMooncakeAgentMetadata, local_block_ids: list[int], layer_index: int):
         #TODO layerwise step8
         # send kv layer to remote
         if len(local_block_ids) == 0:
@@ -710,7 +712,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
         logger.info("Starting listening on path: %s", path)
         with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore
             self.ready_event.set()
-            decoder = msgspec.msgpack.Decoder(type=tuple)
+            decoder = msgspec.msgpack.Decoder(type=str)
             while True:
                 try:
                     frames = sock.recv_multipart()
@@ -724,11 +726,9 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         logger.error("Invalid message format: %s", frames)
                         continue
 
-                    msg = decoder.decode(payload[0])
-                    if msg[0] == PREFILLER_TP_BYE:
-                        request_id = msg[1]
-                        self.task_tracker.mark_request_finished(request_id)
-                        sock.send_multipart((identity, b"", b"ACK"))
+                    request_id = decoder.decode(payload[0])
+                    self.task_tracker.mark_request_finished(request_id)
+                    sock.send_multipart((identity, b"", b"ACK"))
                 except Exception as e:
                     logger.error("Failed to decode message: %s", e)
 
@@ -1324,7 +1324,7 @@ class MooncakeConnectorWorker:
                         kv_caches_base_addr=self.kv_caches_base_addr,
                         num_blocks=self.num_blocks
                     )
-                    encoded_data = msg_encoder.encode([DECODER_TP_HELLO, req_id, metadata])
+                    encoded_data = msg_encoder.encode(metadata)
                     size_in_bytes = len(encoded_data)
                     logger.debug("Size of encoded Mooncake agent metadata: %d bytes", size_in_bytes)
                     with zmq_ctx(zmq.REQ, path) as sock:
