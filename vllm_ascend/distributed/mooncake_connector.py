@@ -1252,16 +1252,16 @@ class MooncakeConnectorWorker:
                     meta.remote_engine_id, len(meta.local_block_ids),
                 len(meta.remote_block_ids))
 
-            remote_handshake_port = meta.remote_port + \
-                                    self._get_remote_tp_rank(req_id)
-            self.kv_recv_thread.add_request(  # type: ignore[union-attr]
-                request_id=req_id,
-                local_block_ids=meta.local_block_ids,
-                remote_block_ids=meta.remote_block_ids,
-                remote_engine_id=meta.remote_engine_id,
-                remote_host=meta.remote_host,
-                remote_handshake_port=remote_handshake_port,
-            )
+                remote_handshake_port = meta.remote_port + \
+                                        self._get_remote_tp_rank(req_id)
+                self.kv_recv_thread.add_request(  # type: ignore[union-attr]
+                    request_id=req_id,
+                    local_block_ids=meta.local_block_ids,
+                    remote_block_ids=meta.remote_block_ids,
+                    remote_engine_id=meta.remote_engine_id,
+                    remote_host=meta.remote_host,
+                    remote_handshake_port=remote_handshake_port,
+                )
         else:
             #TODO layerwise step7
             # decoder send request info to prefiller
