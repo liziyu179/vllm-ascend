@@ -1307,7 +1307,7 @@ class MooncakeConnectorWorker:
                         asyncio.run(self.metaserver_client.post(meta.metaserver, json=message))
             else:
                 for req_id, meta in metadata.requests.items():
-                    path = make_zmq_path("tcp", meta.remote_host, meta.remote_port)
+                    path = make_zmq_path("tcp", meta.remote_host, meta.remote_port + self.tp_rank)
                     msg_encoder = msgspec.msgpack.Encoder()
                     metadata = DecodeMooncakeAgentMetadata(
                         req_id=req_id,
