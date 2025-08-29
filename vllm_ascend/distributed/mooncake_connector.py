@@ -322,22 +322,23 @@ class KVCacheSendingLayerThread(threading.Thread):
                     sock.send_multipart((identity, b"", b"ACK"))
                     with self.lock:
                         self.ready_decode[request_id] = metadata
-                        for layer_name, local_block_ids, layer_index in self.pending_decode.pop(request_id, []):
-                            self.send_layer_thread.send_queue.put((self.ready_decode[request_id], request_id, layer_name, local_block_ids, layer_index))
+                        pending = self.pending_decode.pop(request_id, [])
+                    for layer_name, local_block_ids, layer_index in pending:
+                        self.send_layer_thread.send_queue.put((metadata, request_id, layer_name, local_block_ids, layer_index))
                 except Exception as e:
                     logger.error("Failed to decode message: %s", e)
 
     def _post_transfer(self, request_id: str):
         with self.lock:
             decoder_meta = self.ready_decode.pop(request_id)
-            path = make_zmq_path("tcp", decoder_meta.host, decoder_meta.port)
-            msg_encoder = msgspec.msgpack.Encoder()
-            encoded_data = msg_encoder.encode(request_id)
-            with zmq_ctx(zmq.REQ, path) as sock:
-                ensure_zmq_send(sock, encoded_data)
-                ack = sock.recv()
-                if ack != b"ACK":
-                    raise ValueError(f"Unexpected ACK response: {ack}")
+        path = make_zmq_path("tcp", decoder_meta.host, decoder_meta.port)
+        msg_encoder = msgspec.msgpack.Encoder()
+        encoded_data = msg_encoder.encode(request_id)
+        with zmq_ctx(zmq.REQ, path) as sock:
+            ensure_zmq_send(sock, encoded_data)
+            ack = sock.recv()
+            if ack != b"ACK":
+                raise ValueError(f"Unexpected ACK response: {ack}")
 
 
     def add_request(self, request_id: str, layer_name: str, local_block_ids: list[int], layer_index: int):
@@ -683,9 +684,8 @@ class KVCacheRecvingLayerThread(threading.Thread):
         self.local_engine_id = local_engine_id
         self.side_channel_host = get_ip()
         self.side_channel_port = side_channel_port
-        self.task_tracker = KVCacheTaskTracker(self.tp_rank,
-                                               self.local_engine_id,
-                                               self.tp_size)
+        self.lock = threading.Lock()
+        self.done_requests = set[str]()
         self.ready_event = ready_event
 
 
@@ -695,7 +695,10 @@ class KVCacheRecvingLayerThread(threading.Thread):
         Returns:
             A set of request IDs that have been completed.
         """
-        return self.task_tracker.get_and_clear_finished_requests()
+        with self.lock:
+            finished_requests = self.done_requests
+            self.done_requests = set()
+        return finished_requests
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -727,7 +730,8 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         continue
 
                     request_id = decoder.decode(payload[0])
-                    self.task_tracker.mark_request_finished(request_id)
+                    with self.lock:
+                        self.done_requests.add(request_id)
                     sock.send_multipart((identity, b"", b"ACK"))
                 except Exception as e:
                     logger.error("Failed to decode message: %s", e)
