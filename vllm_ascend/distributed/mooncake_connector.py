@@ -273,6 +273,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.pending_decode = dict[str, list[tuple[str, list[int], int]]]()
         self.total_layers = total_layers
         self.lock = threading.Lock()
+        self.ready_event = ready_event
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """
@@ -351,7 +352,7 @@ class SendingLayerThread(threading.Thread):
 
     def __init__(self, task_tracker: KVCacheTaskTracker, total_layers: int, engine: TransferEngine, local_kv_base_addr: list[str], block_len: list[int], use_mla: bool):
         super().__init__(daemon=True, name="KVCacheRecvingPrefillerByeThread")
-        self.send_queue = queue[tuple[DecodeMooncakeAgentMetadata, str, str, list[int], int]]()
+        self.send_queue = queue.Queue[tuple[DecodeMooncakeAgentMetadata, str, str, list[int], int]]()
         self.task_tracker = task_tracker
         self.total_layers = total_layers
         self.local_kv_base_addr = local_kv_base_addr
@@ -674,7 +675,7 @@ class KVCacheRecvingThread(threading.Thread):
 
 class KVCacheRecvingLayerThread(threading.Thread):
 
-    def __init__(self, tp_rank: int, side_channel_port: int, tp_size: int, local_engine_id: str):
+    def __init__(self, tp_rank: int, side_channel_port: int, tp_size: int, local_engine_id: str, ready_event: threading.Event):
         super().__init__(daemon=True, name="KVCacheRecvingLayerThread")
         self.tp_rank = tp_rank
         self.tp_size = tp_size
@@ -684,6 +685,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
         self.task_tracker = KVCacheTaskTracker(self.tp_rank,
                                                self.local_engine_id,
                                                self.tp_size)
+        self.ready_event = ready_event
 
 
     def get_and_clear_finished_requests(self) -> set[str]:
@@ -1201,7 +1203,8 @@ class MooncakeConnectorWorker:
                 self.kv_recv_thread.start()
                 self.kv_recv_layer_thread = None
             else:
-                self.kv_recv_layer_thread = KVCacheRecvingLayerThread(self.tp_rank, self.side_channel_port, self.tp_size, self.engine_id)
+                self.kv_recv_layer_thread = KVCacheRecvingLayerThread(self.tp_rank, 
+                    self.side_channel_port, self.tp_size, self.engine_id, ready_event)
                 self.kv_recv_layer_thread.start()
                 self.kv_recv_thread = None
         ready_event.wait()
