@@ -1304,6 +1304,8 @@ class MooncakeConnectorWorker:
                 for req_id, meta in metadata.requests.items():
                     if self.tp_rank == 0:
                         kv_transfer_params = {
+                            "do_remote_prefill": True,
+                            "do_remote_decode": False,
                             "remote_engine_id": self.engine_id,
                             "request_id": req_id,
                             "remote_host": self.side_channel_host,
