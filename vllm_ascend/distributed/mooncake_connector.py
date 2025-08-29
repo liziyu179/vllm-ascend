@@ -301,12 +301,6 @@ class KVCacheSendingLayerThread(threading.Thread):
         #    while True:
         #       recv_msg from decode and add to self.decode_request
         # 
-        encoder = msgspec.msgpack.Encoder()
-        encoded_data = encoder.encode(self.metadata)
-        size_in_bytes = len(encoded_data)
-        logger.debug("Size of encoded MooncakeAgentMetadata: %s bytes",
-                     str(size_in_bytes))
-
         # Listen for new requests for metadata.
         # NOTE(rob): we need each rank to have a unique port. This hack to keeps
         # us moving. We will switch when moving to etcd or where we have a
@@ -702,13 +696,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
         #TODO layerwise step9
         # with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore
         #    while True:
-        #       recv_msg from prefill request send finish
-        encoder = msgspec.msgpack.Encoder()
-        encoded_data = encoder.encode(self.metadata)
-        size_in_bytes = len(encoded_data)
-        logger.debug("Size of encoded MooncakeAgentMetadata: %s bytes",
-                     str(size_in_bytes))
-
+        #       recv_msg from prefill request send finish=
         # Listen for new requests for metadata.
         # NOTE(rob): we need each rank to have a unique port. This hack to keeps
         # us moving. We will switch when moving to etcd or where we have a
@@ -1203,7 +1191,7 @@ class MooncakeConnectorWorker:
                 self.kv_send_layer_thread.start()
                 self.kv_send_thread = None
         else:
-            if self.layer_wise:
+            if not self.layer_wise:
                 self.kv_recv_thread = KVCacheRecvingThread(
                     self.tp_rank, self.tp_size, self.engine, self.engine_id,
                     self.handshake_port, kv_caches_base_addr, self.block_len,
