@@ -1293,17 +1293,18 @@ class MooncakeConnectorWorker:
             #   } to Meta Server
             if self.vllm_config.kv_transfer_config.is_kv_producer:
                 for req_id, meta in metadata.requests.items():
-                    kv_transfer_params = {
-                        "remote_engine_id": self.engine_id,
-                        "request_id": req_id,
-                        "remote_host": self.side_channel_host,
-                        "remote_port": self.side_channel_port
-                    }
-                    message = {
-                        "request_id": req_id,
-                        "kv_transfer_params": kv_transfer_params
-                    }
-                    asyncio.run(self.metaserver_client.post(meta.metaserver, json=message))
+                    if self.tp_rank == 0:
+                        kv_transfer_params = {
+                            "remote_engine_id": self.engine_id,
+                            "request_id": req_id,
+                            "remote_host": self.side_channel_host,
+                            "remote_port": self.side_channel_port
+                        }
+                        message = {
+                            "request_id": req_id,
+                            "kv_transfer_params": kv_transfer_params
+                        }
+                        asyncio.run(self.metaserver_client.post(meta.metaserver, json=message))
             else:
                 for req_id, meta in metadata.requests.items():
                     path = make_zmq_path("tcp", meta.remote_host, meta.remote_port)
