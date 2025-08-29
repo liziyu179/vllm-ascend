@@ -330,7 +330,7 @@ class KVCacheSendingLayerThread(threading.Thread):
     def _post_transfer(self, request_id: str):
         with self.lock:
             decoder_meta = self.ready_decode.pop(request_id)
-            path = make_zmq_path("tcp", decoder_meta.remote_host, decoder_meta.remote_handshake_port)
+            path = make_zmq_path("tcp", decoder_meta.host, decoder_meta.port)
             msg_encoder = msgspec.msgpack.Encoder()
             encoded_data = msg_encoder.encode(request_id)
             with zmq_ctx(zmq.REQ, path) as sock:
