@@ -268,7 +268,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.task_tracker = KVCacheTaskTracker(self.tp_rank,
                                                self.local_engine_id,
                                                self.decode_tp_size)
-        self.send_layer_thread = SendingLayerThread(self.task_tracker, engine, local_kv_base_addr, block_len, use_mla)  # TODO layerwise step8
+        self.send_layer_thread = SendingLayerThread(self.task_tracker, total_layers, engine, local_kv_base_addr, block_len, use_mla)
         self.ready_decode = dict[str, DecodeMooncakeAgentMetadata]()
         self.pending_decode = dict[str, list[tuple[str, list[int], int]]]()
         self.total_layers = total_layers
@@ -349,12 +349,11 @@ class KVCacheSendingLayerThread(threading.Thread):
 
 class SendingLayerThread(threading.Thread):
 
-    def __init__(self, task_tracker, port: int, finished: KVCacheTaskTracker, total_layers: int, engine: TransferEngine, local_kv_base_addr: list[str], block_len: list[int], use_mla: bool):
+    def __init__(self, task_tracker: KVCacheTaskTracker, total_layers: int, engine: TransferEngine, local_kv_base_addr: list[str], block_len: list[int], use_mla: bool):
         super().__init__(daemon=True, name="KVCacheRecvingPrefillerByeThread")
         self.send_queue = queue[tuple[DecodeMooncakeAgentMetadata, str, str, list[int], int]]()
         self.task_tracker = task_tracker
         self.total_layers = total_layers
-        self.port = port
         self.local_kv_base_addr = local_kv_base_addr
         self.block_len = block_len
         self.use_mla = use_mla
