@@ -265,10 +265,10 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.local_engine_id = local_engine_id
         self.side_channel_host = side_channel_host
         self.side_channel_port = side_channel_port
-        self.send_layer_thread = SendingLayerThread(self.task_tracker, engine, local_kv_base_addr, block_len, use_mla)  # TODO layerwise step8
         self.task_tracker = KVCacheTaskTracker(self.tp_rank,
                                                self.local_engine_id,
                                                self.decode_tp_size)
+        self.send_layer_thread = SendingLayerThread(self.task_tracker, engine, local_kv_base_addr, block_len, use_mla)  # TODO layerwise step8
         self.ready_decode = dict[str, DecodeMooncakeAgentMetadata]()
         self.pending_decode = dict[str, list[tuple[str, list[int], int]]]()
         self.total_layers = total_layers
@@ -680,6 +680,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.local_engine_id = local_engine_id
+        self.side_channel_host = get_ip()
         self.side_channel_port = side_channel_port
         self.task_tracker = KVCacheTaskTracker(self.tp_rank,
                                                self.local_engine_id,
