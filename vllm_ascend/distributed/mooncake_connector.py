@@ -1310,7 +1310,7 @@ class MooncakeConnectorWorker:
                             "request_id": req_id,
                             "kv_transfer_params": kv_transfer_params
                         }
-                        asyncio.run(self.metaserver_client.post(meta.metaserver, json=message))
+                        asyncio.get_event_loop().create_task(self.metaserver_client.post(meta.metaserver, json=message))
             else:
                 for req_id, meta in metadata.requests.items():
                     path = make_zmq_path("tcp", meta.remote_host, meta.remote_port + self.tp_rank)
