@@ -747,7 +747,6 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             remote_engine_id=kv_transfer_params["remote_engine_id"],
             remote_host=kv_transfer_params["remote_host"],
             remote_port=kv_transfer_params["remote_port"],
-            remote_dp_rank = kv_transfer_params["remote_dp_rank"],
             metaserver=metaserver,
             remote_tp_size = kv_transfer_params.get("remote_tp_size", None),
         )
