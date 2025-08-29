@@ -289,7 +289,7 @@ class KVCacheSendingLayerThread(threading.Thread):
             encoded_data = msg_encoder.encode([PREFILLER_TP_BYE, request_id])
             with zmq_ctx(zmq.REQ, path) as sock:
                 ensure_zmq_send(sock, encoded_data)
-                ack = ensure_zmq_recv(sock)
+                ack = sock.recv()
                 if ack != b"ACK":
                     raise ValueError(f"Unexpected ACK response: {ack}")
         return finished_request
@@ -1330,7 +1330,7 @@ class MooncakeConnectorWorker:
                     logger.debug("Size of encoded Mooncake agent metadata: %d bytes", size_in_bytes)
                     with zmq_ctx(zmq.REQ, path) as sock:
                         ensure_zmq_send(sock, encoded_data)
-                        ack = ensure_zmq_recv(sock)
+                        ack = sock.recv()
                         if ack != b"ACK":
                             raise ValueError(f"Unexpected ACK from prefill node: {ack}")
 
