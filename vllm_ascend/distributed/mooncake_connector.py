@@ -387,7 +387,8 @@ class SendingLayerThread(threading.Thread):
             logger.error("Failed to transfer KV cache for request "
                          f"{request_id}: {e}")
         finally:
-            self.task_tracker.update_done_task_count(request_id, self.tp_rank)
+            if layer_index == self.total_layers - 1:
+                self.task_tracker.update_done_task_count(request_id, self.tp_rank)
             self.send_queue.task_done()
 
     def _transfer_kv_cache(self, req_meta: DecodeMooncakeAgentMetadata, request_id: str, layer_name: str, local_block_ids: list[int], layer_index: int):
@@ -425,9 +426,6 @@ class SendingLayerThread(threading.Thread):
             logger.error("Mooncake transfer failed for request %s",
                          req_meta["request_id"])
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
-
-        if layer_index == self.total_layers - 1:
-            self.task_tracker.mark_task_done(request_id)
 
 class KVCacheRecvingThread(threading.Thread):
 
