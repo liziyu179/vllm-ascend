@@ -73,12 +73,12 @@ class ReqMeta:
 class SendTask:
     send_request: dict[str, ReqMeta] = field(default_factory=dict)
     # pd_head_ratio == 1 use
-    wait_event: Optional[torch.npu.Event] = None
+    wait_event: Optional[torch.npu.Event]
     # pd_head_ratio > 1 use
-    k_cache: Optional[torch.Tensor] = None
-    v_cache: Optional[torch.Tensor] = None
+    k_cache: Optional[torch.Tensor]
+    v_cache: Optional[torch.Tensor]
     layer_idx: int = 0
-    rearrange_block_ids: Optional[list[int]] = None
+    rearrange_block_ids: Optional[list[int]]
 
 
 @dataclass
@@ -191,7 +191,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                 f"Failed to transfer KV cache for layer idx {send_task.layer_idx}, {e}"
             )
 
-    def get_transfer_meta(self, send_task, req_id, req_meta):
+    def get_transfer_meta(self, send_task: SendTask, req_id: str,
+                          req_meta: ReqMeta):
         src_list, dst_list, length_list = [], [], []
         # not need to send kv cache
         if self.tp_rank % self.num_head_replica != 0:
@@ -281,7 +282,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                 self.v_buffer[:value.shape[0]].copy_(value)
 
         # Merge transmission tasks of the same session
-        session_meta = {}
+        session_meta: dict[str, dict[str, list]] = {}
         for req_id, req_meta in send_task.send_request.items():
             session_id = f"{req_meta.remote_host}:{req_meta.remote_te_rpc_port}"
             if session_id not in session_meta.keys():
