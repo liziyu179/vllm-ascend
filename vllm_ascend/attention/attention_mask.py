@@ -17,6 +17,7 @@ from vllm.distributed import get_pcp_group
 
 from vllm_ascend.platform import ModelConfig
 from vllm_ascend.utils import singleton
+from vllm.utils import is_restore
 
 
 def _generate_attn_mask(max_seq_len, dtype):
@@ -41,11 +42,16 @@ class AttentionMaskBuilder:
         self.chunked_prefill_attn_mask = None
         self.pcp_mla_mask = None
         self.swa_mask = None
+        self.restore_first = True
 
     def get_attn_mask(self, max_seq_len: int, dtype: torch.dtype):
         if self.attn_mask_cache is None or max_seq_len > self._seq_len_cached:
             self.attn_mask_cache = _generate_attn_mask(max_seq_len, dtype)
             self._seq_len_cached = max_seq_len
+        if is_restore() and self.restore_first:
+            self.attn_mask_cache = _generate_attn_mask(max_seq_len, dtype)
+            self._seq_len_cached = max_seq_len
+            self.restore_first = False
         assert self.attn_mask_cache is not None, "Something is wrong in generate_attn_mask."
         if self.attn_mask_cache.dtype != dtype:
             self.attn_mask_cache = self.attn_mask_cache.to(dtype)

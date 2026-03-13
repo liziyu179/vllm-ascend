@@ -323,6 +323,10 @@ class AscendFusedMoE(FusedMoE):
 
                 set_flash_common3_context(topk_weights=topk_weights, topk_ids=topk_ids)
 
+        forward_context.moe_comm_method.prepare_finalize.moe_config.tp_group = get_tp_group()
+        forward_context.moe_comm_method.prepare_finalize.moe_config.dp_group = get_dp_group()
+        forward_context.moe_comm_method.prepare_finalize.moe_config.ep_group = get_ep_group()
+        forward_context.moe_comm_method.prepare_finalize.moe_config.mc2_group = get_mc2_group()
         hidden_states, router_logits, mc2_mask, context_metadata = forward_context.moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
