@@ -187,6 +187,13 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         dynamic_eplb: bool = False,
         pertoken_scale: torch.Tensor | None = None,
     ):
+        # [snapshot] update moe_all_to_all_group_name
+        device_group = get_mc2_group().device_group
+        # TODO: Try local_rank = ep_group.rank_in_group
+        local_rank = torch.distributed.get_rank(group=device_group)
+        backend = device_group._get_backend(torch.device("npu"))
+        self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
+        
         self.with_quant = with_quant
 
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(

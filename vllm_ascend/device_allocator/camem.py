@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
-from acl.rt import memcpy  # type: ignore # noqa: F401
+# from acl.rt import memcpy  # type: ignore # noqa: F401
 from vllm.logger import logger
 
 
@@ -182,45 +182,47 @@ class CaMemAllocator:
         :param offload_tags: The tags of the memory allocation that will be
             offloaded. The rest of the memory allocation will be discarded.
         """
-        if offload_tags is None:
-            # by default, allocated tensors are offloaded
-            # when the allocator sleeps
-            offload_tags = (CaMemAllocator.default_tag,)
-        elif isinstance(offload_tags, str):
-            offload_tags = (offload_tags,)
+        pass
+        # if offload_tags is None:
+        #     # by default, allocated tensors are offloaded
+        #     # when the allocator sleeps
+        #     offload_tags = (CaMemAllocator.default_tag,)
+        # elif isinstance(offload_tags, str):
+        #     offload_tags = (offload_tags,)
 
-        assert isinstance(offload_tags, tuple)
+        # assert isinstance(offload_tags, tuple)
 
-        for ptr, data in self.pointer_to_data.items():
-            handle = data.handle
-            if data.tag in offload_tags:
-                size_in_bytes = handle[1]
-                cpu_backup_tensor = torch.empty(size_in_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
-                cpu_ptr = cpu_backup_tensor.data_ptr()
-                ACL_MEMCPY_DEVICE_TO_HOST = 2
-                dest_max = cpu_ptr + size_in_bytes * 2
-                memcpy(cpu_ptr, dest_max, ptr, size_in_bytes, ACL_MEMCPY_DEVICE_TO_HOST)
-                data.cpu_backup_tensor = cpu_backup_tensor
-            unmap_and_release(handle)
+        # for ptr, data in self.pointer_to_data.items():
+        #     handle = data.handle
+        #     if data.tag in offload_tags:
+        #         size_in_bytes = handle[1]
+        #         cpu_backup_tensor = torch.empty(size_in_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+        #         cpu_ptr = cpu_backup_tensor.data_ptr()
+        #         ACL_MEMCPY_DEVICE_TO_HOST = 2
+        #         dest_max = cpu_ptr + size_in_bytes * 2
+        #         memcpy(cpu_ptr, dest_max, ptr, size_in_bytes, ACL_MEMCPY_DEVICE_TO_HOST)
+        #         data.cpu_backup_tensor = cpu_backup_tensor
+        #     unmap_and_release(handle)
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         """
         Wake up the allocator from sleep mode.
         All data that is previously offloaded will be loaded back to GPU
         memory, and the rest of the data will have empty memory."""
-        for ptr, data in self.pointer_to_data.items():
-            if tags is None or data.tag in tags:
-                handle = data.handle
-                create_and_map(handle)
-                if data.cpu_backup_tensor is not None:
-                    cpu_backup_tensor = data.cpu_backup_tensor
-                    if cpu_backup_tensor is not None:
-                        size_in_bytes = cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
-                        cpu_ptr = cpu_backup_tensor.data_ptr()
-                        ACL_MEMCPY_HOST_TO_DEVICE = 1
-                        dest_max = ptr + size_in_bytes * 2
-                        memcpy(ptr, dest_max, cpu_ptr, size_in_bytes, ACL_MEMCPY_HOST_TO_DEVICE)
-                        data.cpu_backup_tensor = None
+        pass
+        # for ptr, data in self.pointer_to_data.items():
+        #     if tags is None or data.tag in tags:
+        #         handle = data.handle
+        #         create_and_map(handle)
+        #         if data.cpu_backup_tensor is not None:
+        #             cpu_backup_tensor = data.cpu_backup_tensor
+        #             if cpu_backup_tensor is not None:
+        #                 size_in_bytes = cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
+        #                 cpu_ptr = cpu_backup_tensor.data_ptr()
+        #                 ACL_MEMCPY_HOST_TO_DEVICE = 1
+        #                 dest_max = ptr + size_in_bytes * 2
+        #                 memcpy(ptr, dest_max, cpu_ptr, size_in_bytes, ACL_MEMCPY_HOST_TO_DEVICE)
+        #                 data.cpu_backup_tensor = None
 
     @contextmanager
     def use_memory_pool(self, tag: str | None = None):

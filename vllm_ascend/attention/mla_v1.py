@@ -1409,6 +1409,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         # decode_ql_nope, decode_q_pe, decode_k_pe, decode_k_nope
         # 4. Preprocess prefill tokens, write kv cache and get:
         # prefill_q_nope, prefill_q_pe, prefill_k_nope, prefill_k_pe, prefill_value
+
         has_decode = attn_metadata.num_decodes > 0
         has_prefill = attn_metadata.num_prefills > 0
         if self.fused_qkv_a_proj is not None:
