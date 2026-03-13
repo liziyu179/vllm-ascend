@@ -19,6 +19,9 @@
 
 import copy
 import gc
+import os, time
+from datetime import datetime
+from ctypes import CDLL
 from types import NoneType
 
 import torch
@@ -28,7 +31,7 @@ import vllm.envs as envs_vllm
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
-from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
+from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment, cleanup_dist_env_and_memory, cleanup_dist_env_for_snapshot
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
@@ -49,7 +52,7 @@ from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
-from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel, destroy_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -389,6 +392,126 @@ class NPUWorker(WorkerBase):
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
+
+    def aclrt_snapshot_process_lock(self) -> None:
+        # 加载.so文件
+        npu_aclrt_lib = CDLL("/usr/local/Ascend/cann-9.0.0/aarch64-linux/lib64/libacl_rt.so")
+        
+        # 返回为0成功，其他为失败
+        # 调用aclrtSnapShotProcessLock()，将卡上的任务锁住
+        aclrtSnapShotProcessLock_result = npu_aclrt_lib.aclrtSnapShotProcessLock()
+        if aclrtSnapShotProcessLock_result == 0:
+            logger.info(f"[rank: {self.rank}] [snapshot] aclrtSnapShotProcessLock success.")
+        else:
+            logger.error(f"[rank: {self.rank}] [snapshot] aclrtSnapShotProcessLock failed {aclrtSnapShotProcessLock_result}.")
+        
+    def aclrt_snapshot_process_backup(self) -> None:
+        # 加载.so文件
+        npu_aclrt_lib = CDLL("/usr/local/Ascend/cann-9.0.0/aarch64-linux/lib64/libacl_rt.so")
+        # 调用aclrtSnapShotProcessBackup() 
+        aclrtSnapShotProcessBackup_result = npu_aclrt_lib.aclrtSnapShotProcessBackup()
+        if aclrtSnapShotProcessBackup_result == 0:
+            logger.info(f"[rank: {self.rank}] [snapshot] aclrtSnapShotProcessBackup success.")
+        else:
+            logger.error(f"[rank: {self.rank}] [snapshot] aclrtSnapShotProcessBackup failed {aclrtSnapShotProcessBackup_result}.")
+            
+    def aclrt_snapshot_process_restore(self) -> None:
+        # 加载.so文件
+        npu_aclrt_lib = CDLL("/usr/local/Ascend/cann-9.0.0/aarch64-linux/lib64/libacl_rt.so")
+        # 调用aclrtSnapShotProcessRestore()
+        aclrtSnapShotProcessRestore_result = npu_aclrt_lib.aclrtSnapShotProcessRestore()
+        if aclrtSnapShotProcessRestore_result == 0:
+            logger.info(f"[rank: {self.rank}] [snapshot] aclrtSnapShotProcessRestore success.")
+        else:
+            logger.error(f"[rank: {self.rank}] [snapshot] aclrtSnapShotProcessRestore failed {aclrtSnapShotProcessRestore_result}.")
+            
+    def aclrt_snapshot_process_unlock(self) -> None:
+        # 加载.so文件
+        npu_aclrt_lib = CDLL("/usr/local/Ascend/cann-9.0.0/aarch64-linux/lib64/libacl_rt.so")
+        # 调用aclrtSnapShotProcessUnlock()
+        aclrtSnapShotProcessUnlock_result = npu_aclrt_lib.aclrtSnapShotProcessUnlock()
+        if aclrtSnapShotProcessUnlock_result == 0:
+            logger.info(f"[rank: {self.rank}] [snapshot] aclrtSnapShotProcessUnlock success.")
+        else:
+            logger.error(f"[rank: {self.rank}] [snapshot] aclrtSnapShotProcessUnlock failed {aclrtSnapShotProcessUnlock_result}.")
+    
+    def acl_recover_all_hccl_tasks(self) -> None:
+        # 加载.so文件
+        npu_aclrt_lib = CDLL("/usr/local/Ascend/cann-9.0.0/aarch64-linux/lib64/libacl_rt.so")
+        # 调用aclError aclRecoverAllHcclTasks(int32_t deviceId)
+        deviceId = torch.npu.current_device()
+        aclRecoverAllHcclTasks_result = npu_aclrt_lib.aclRecoverAllHcclTasks(deviceId)
+        if aclRecoverAllHcclTasks_result == 0:
+            logger.info(f"[rank: {self.rank}] [snapshot] aclRecoverAllHcclTasks for device: {deviceId} success.")
+        else:
+            logger.error(f"[rank: {self.rank}] [snapshot] aclRecoverAllHcclTasks for device: {deviceId} failed {aclRecoverAllHcclTasks_result}.")
+
+    def re_load_weights(self) -> None:
+        self.model_runner.restore_model()
+
+    def dump_model(self) -> None:
+        self.model_runner.dump_model()
+ 
+    def clean_up(self) -> None:
+        destroy_ascend_model_parallel()
+        logger.info("destroy_ascend_model_parallel()")
+        # for snapshot
+        cleanup_dist_env_for_snapshot()
+        logger.info("cleanup_dist_env_for_snapshot()")
+        
+    def rebuild_group_lhc(self) -> None:
+        import torch.distributed as dist
+        # 如果是DEBUG会引入torchair库中的一个BUG
+        dist.set_debug_level(dist.DebugLevel.INFO)
+        rebuild_time_start = time.time()
+        
+        # step 1 销毁通信域
+        info = f"--- destroy group rank{self.rank} start at {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}"
+        logger.warning(info)
+
+        self.clean_up()
+
+        # step 2 重建通信域
+        rebuild_time_start = time.time()
+        info = f"--- rebuild group rank{self.rank} start at {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}"
+        logger.warning(info)
+        
+        logger.warning(f"call _init_worker_distributed_environment with parallel_config {str(self.parallel_config)}")
+        logger.warning(f"old url {self.distributed_init_method}, add 1 to port")
+        import urllib.parse
+        init_method_res = urllib.parse.urlparse(self.distributed_init_method)
+        new_method = urllib.parse.urlunparse(init_method_res._replace(netloc=f"{init_method_res.hostname}:{init_method_res.port+1}"))
+        self.distributed_init_method = new_method
+        
+        with (((set_current_vllm_config(self.vllm_config)))): 
+            self._init_worker_distributed_environment()
+        
+        info = f"[time] rank {self.rank} rebuild_group cost {time.time() - rebuild_time_start}s"
+        #logger.info(f"os.environ['HCCL_IF_IP'] :::{os.environ['HCCL_IF_IP'] }")
+        logger.warning(info)
+        
+    # def reinit_process_group(self):
+    #     reinit_time_start = time.time()
+    #     torch_npu.distributed.reinit_process_group(None, False)
+    #     info = f"--------- [time] rank {self.rank} reinit_process_group cost {time.time() - reinit_time_start}s -----------"
+    #     logger.warning(info)
+        
+    # def re_capture_model(self):
+    #     self.model_runner.capture_model()
+        
+    # 快照restore之后信息刷新：1. 刷新HCCL_IF_IP环境变量的值为新调度的pod ip 2. 刷新data_parallel_master_ip的值为最新的主节点pod ip
+    def after_snapshot_restore_update_info_for_worker(self, hccl_if_ip: str, data_parallel_master_ip: str):
+        os.environ['HCCL_IF_IP'] = hccl_if_ip
+        os.environ['VLLM_HOST_IP'] = hccl_if_ip
+        envs_vllm.VLLM_HOST_IP = hccl_if_ip
+        self.vllm_config.parallel_config.data_parallel_master_ip = data_parallel_master_ip
+        logger.warning(f"[snapshot] worker : After snapshot restore, update HCCL_IF_IP to {hccl_if_ip}, data_parallel_master_ip to {data_parallel_master_ip}")
+        # 更新kv cache传输的ip为最新ip, 直接让MooncakeLayerwiseConnectorWorker重新获取一次ip
+        # from vllm.distributed.kv_transfer import get_kv_transfer_group
+        # from vllm.utils.network_utils import get_ip
+        # kv_connector = get_kv_transfer_group()
+        # kv_connector.connector_worker.side_channel_host = get_ip()
+        # logger.warning(f"[snapshot] worker : After snapshot restore, update side_channel_host to {get_ip()}")
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:

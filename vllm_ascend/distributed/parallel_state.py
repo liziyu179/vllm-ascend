@@ -269,49 +269,59 @@ def destroy_ascend_model_parallel():
     global _MC2
     if _MC2:
         _MC2.destroy()
+    del _MC2
     _MC2 = None
 
     global _MLP_TP
     if _MLP_TP:
         _MLP_TP.destroy()
+    del _MLP_TP
     _MLP_TP = None
 
     global _LMTP
     if _LMTP:
         _LMTP.destroy()
+    del _LMTP
     _LMTP = None
 
     global _EMBED_TP
     if _EMBED_TP:
         _EMBED_TP.destroy()
+    del _EMBED_TP
     _EMBED_TP = None
 
     global _OTP
     if _OTP:
         _OTP.destroy()
+    del _OTP
     _OTP = None
 
     global _P_TP
     if _P_TP:
         _P_TP.destroy()
+    del _P_TP
     _P_TP = None
 
     global _FLASHCOMM2_OTP
     if _FLASHCOMM2_OTP and get_ascend_config().flashcomm2_oproj_tensor_parallel_size != 1:
         _FLASHCOMM2_OTP.destroy()
+        del _FLASHCOMM2_OTP
         _FLASHCOMM2_OTP = None
 
     global _FLASHCOMM2_ODP
     if _FLASHCOMM2_ODP and get_ascend_config().flashcomm2_oproj_tensor_parallel_size != 1:
         _FLASHCOMM2_ODP.destroy()
+        del _FLASHCOMM2_ODP
         _FLASHCOMM2_ODP = None
 
     global _SHARD_WEIGHT
     if _SHARD_WEIGHT:
         _SHARD_WEIGHT.destroy()
+    del _SHARD_WEIGHT
     _SHARD_WEIGHT = None
 
     global _FC3_QUANT_X
     if _FC3_QUANT_X:
         _FC3_QUANT_X.destroy()
+    del _FC3_QUANT_X
     _FC3_QUANT_X = None

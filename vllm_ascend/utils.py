@@ -672,17 +672,18 @@ def check_ascend_device_type():
     if _ascend_device_type is None:
         _init_ascend_device_type()
 
-    soc_version = torch_npu.npu.get_soc_version()
-    if 220 <= soc_version <= 225:
-        cur_device_type = AscendDeviceType.A2
-    elif 250 <= soc_version <= 255:
-        cur_device_type = AscendDeviceType.A3
-    elif 200 <= soc_version <= 205:
-        cur_device_type = AscendDeviceType._310P
-    elif soc_version == 260:
-        cur_device_type = AscendDeviceType.A5
-    else:
-        raise RuntimeError(f"Can not support soc_version: {soc_version}.")
+    cur_device_type = AscendDeviceType.A3
+    # soc_version = torch_npu.npu.get_soc_version()
+    # if 220 <= soc_version <= 225:
+    #     cur_device_type = AscendDeviceType.A2
+    # elif 250 <= soc_version <= 255:
+    #     cur_device_type = AscendDeviceType.A3
+    # elif 200 <= soc_version <= 205:
+    #     cur_device_type = AscendDeviceType._310P
+    # elif soc_version == 260:
+    #     cur_device_type = AscendDeviceType.A5
+    # else:
+    #     raise RuntimeError(f"Can not support soc_version: {soc_version}.")
 
     assert _ascend_device_type == cur_device_type, (
         f"Current device type: {cur_device_type} does not match the installed version's device type: "

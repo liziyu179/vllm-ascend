@@ -16,7 +16,10 @@
 # This file is a part of the vllm-ascend project.
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
-
+import gc
+import os
+import ctypes
+import time
 import math
 import sys
 from collections import defaultdict
@@ -2301,6 +2304,65 @@ class NPUModelRunner(GPUModelRunner):
             self.eplb_loader.set_adator(self.eplb_adaptor)
             self.eplb_updator.set_adaptor(self.eplb_adaptor)
             self.eplb_updator.warm_up_eplb()
+
+    def dump_model(self) -> None:
+        model_save_path = "/mnt/snapshot_weight/" + self.vllm_config.model_config.model.rsplit('/', 1)[-1] + "/model_ckpt." + str(self.dp_rank) + "tp"+ str(get_tp_group().rank_in_group) + ".pth"
+        logger.info(f"model type is {type(self.model)}")
+        if os.path.exists(model_save_path):
+            return
+        os.makedirs("/mnt/snapshot_weight/" + self.vllm_config.model_config.model.rsplit('/', 1)[-1], exist_ok=True)
+        logger.info("[dump model] start dump model to %s", model_save_path)
+        start = time.time()
+        import psutil
+        process = psutil.Process(os.getpid())
+        logger.info(f"start dump_model() cpu memory use: {process.memory_info().rss / 1024**2:.2f} MB")
+        torch.save(self.model.state_dict(), model_save_path)
+        gc.collect()
+        logger.info(f"after gc.collect() cpu memory use: {process.memory_info().rss / 1024**2:.2f} MB")
+        torch.npu.empty_cache()
+        logger.info(f"after torch.npu.empty_cache() cpu memory use: {process.memory_info().rss / 1024**2:.2f} MB")
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            result = libc.malloc_trim(0)
+            if result == 1:
+                print("exec malloc_trim(0) sucess")
+            else:
+                print("exec malloc_trim(0) fail")
+        except Exception as e:
+            print(f"exec malloc_trim(0) with error: {e}")
+        
+        logger.info(f"after dump_model() cpu memory use: {process.memory_info().rss / 1024**2:.2f} MB")
+        elapse = time.time() - start
+        logger.info("[dump model] save model ckpt to %s, elapse %.4f s", model_save_path, elapse)
+
+    def restore_model(self) -> None:
+        model_save_path = "/mnt/snapshot_weight/" + self.vllm_config.model_config.model.rsplit('/', 1)[-1] + "/model_ckpt." + str(self.dp_rank) +"tp"+ str(get_tp_group().rank_in_group) + ".pth"
+        start = time.time()
+        sd = torch.load(model_save_path, map_location='cpu', mmap=True)
+        logger.info(f"[restore model] load model to cpu from {model_save_path}, elapse {time.time() - start}s, the num of items is {len(sd.items())}")
+        cnt = 0
+
+        param_dict = dict(self.model.named_parameters())
+        buffer_dict = dict(self.model.named_buffers())
+        for name, cpu_tensor in sd.items():
+            hit = False
+            if name in param_dict:
+                npu_tensor = param_dict[name]
+                print(f"[weight] get parameter {name}!", flush=True)
+                npu_tensor.data.copy_(cpu_tensor)
+                cnt+=1
+                hit = True
+
+            if name in buffer_dict:
+                npu_tensor = buffer_dict[name]
+                print(f"[weight] get buffer {name}!", flush=True)
+                npu_tensor.data.copy_(cpu_tensor)
+                cnt+=1
+                hit = True
+        
+        logger.info(f"replace success {cnt} / {len(sd.items())}")
+        elapse = time.time() - start
+        logger.info("[restore model] restore model ckpt from %s, elapse %.4f s", model_save_path, elapse)
 
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
