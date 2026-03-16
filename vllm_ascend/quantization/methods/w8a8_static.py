@@ -29,7 +29,6 @@ from vllm_ascend.utils import (
 from .base import AscendLinearScheme
 from .registry import register_scheme
 from vllm.utils import is_restore
-visit_layers = set()
 
 @register_scheme("W8A8", "linear")
 class AscendW8A8LinearMethod(AscendLinearScheme):
@@ -79,30 +78,6 @@ class AscendW8A8LinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        global visit_layers
-        if is_restore():
-            if layer.prefix in visit_layers:
-                expanding_factor = layer.weight.data.shape[1]
-                layer.aclnn_input_scale = torch.nn.Parameter(
-                    layer.input_scale.data.repeat(expanding_factor), requires_grad=False
-                )
-                layer.aclnn_input_scale_reciprocal = 1 / torch.nn.Parameter(
-                    layer.input_scale.data.repeat(expanding_factor), requires_grad=False
-                )
-                layer.aclnn_input_offset = torch.nn.Parameter(
-                    layer.input_offset.data.repeat(expanding_factor), requires_grad=False
-                ).to(layer.aclnn_input_scale.dtype)
-
-                layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
-                layer.weight.data = maybe_trans_nz(layer.weight.data)
-                layer.weight_scale.data = torch.flatten(layer.weight_scale.data)
-                layer.weight_offset.data = torch.flatten(layer.weight_offset.data)
-                ascend_quant_method = getattr(layer, "ascend_quant_method", "")
-                if ascend_quant_method == COMPRESSED_TENSORS_METHOD:
-                    deq_scale = layer.input_scale.data * layer.weight_scale.data
-                    layer.deq_scale = torch.nn.Parameter(deq_scale, requires_grad=False)
-                visit_layers.remove(layer.prefix)
-    
         if x.dtype != torch.int8:
             layer_cls_name = layer.__class__.__name__
             weight_prefetch_method = get_weight_prefetch_method()
@@ -167,26 +142,37 @@ class AscendW8A8LinearMethod(AscendLinearScheme):
         return output
 
     def process_weights_after_loading(self, layer):
-        global visit_layers
         expanding_factor = layer.weight.data.shape[1]
-        layer.aclnn_input_scale = torch.nn.Parameter(
-            layer.input_scale.data.repeat(expanding_factor), requires_grad=False
+        
+        # 使用register_parameter注册参数
+        input_scale_repeated = layer.input_scale.data.repeat(expanding_factor)
+        layer.register_parameter(
+            'aclnn_input_scale', 
+            torch.nn.Parameter(input_scale_repeated, requires_grad=False)
         )
-        layer.aclnn_input_scale_reciprocal = 1 / torch.nn.Parameter(
-            layer.input_scale.data.repeat(expanding_factor), requires_grad=False
+        
+        # 对于reciprocal，直接创建Parameter并注册
+        input_scale_reciprocal = 1 / input_scale_repeated
+        layer.register_parameter(
+            'aclnn_input_scale_reciprocal',
+            torch.nn.Parameter(input_scale_reciprocal, requires_grad=False)
         )
-        layer.aclnn_input_offset = torch.nn.Parameter(
-            layer.input_offset.data.repeat(expanding_factor), requires_grad=False
-        ).to(layer.aclnn_input_scale.dtype)
+        
+        input_offset_repeated = layer.input_offset.data.repeat(expanding_factor)
+        layer.register_parameter(
+            'aclnn_input_offset',
+            torch.nn.Parameter(input_offset_repeated.to(input_scale_reciprocal.dtype), requires_grad=False)
+        )
 
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = maybe_trans_nz(layer.weight.data)
         layer.weight_scale.data = torch.flatten(layer.weight_scale.data)
         layer.weight_offset.data = torch.flatten(layer.weight_offset.data)
+        
         ascend_quant_method = getattr(layer, "ascend_quant_method", "")
         if ascend_quant_method == COMPRESSED_TENSORS_METHOD:
             deq_scale = layer.input_scale.data * layer.weight_scale.data
-            layer.deq_scale = torch.nn.Parameter(deq_scale, requires_grad=False)
-
-        if not is_restore() and layer.prefix not in visit_layers:
-            visit_layers.add(layer.prefix)
+            layer.register_parameter(
+                'deq_scale',
+                torch.nn.Parameter(deq_scale, requires_grad=False)
+            )

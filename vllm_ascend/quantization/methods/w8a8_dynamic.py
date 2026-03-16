@@ -34,10 +34,8 @@ from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType
 from .registry import register_scheme
-
 from vllm.utils import is_restore
-visit_dyn = set()
-visit_fused = set()
+
 
 
 def scale_from_float_to_int64(scale):
@@ -82,15 +80,6 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        global visit_dyn
-        if is_restore() and layer.prefix in visit_dyn:
-            layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
-            # cast quantized weight tensors in NZ format for higher inference speed
-            layer.weight.data = maybe_trans_nz(layer.weight.data)
-            layer.weight_scale.data = layer.weight_scale.data.flatten()
-            layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
-            layer.weight_offset.data = layer.weight_offset.data.flatten()
-            visit_dyn.remove(layer.prefix)
         quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x)
         output = torch_npu.npu_quant_matmul(
             quantized_x,
@@ -103,13 +92,15 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
         return output
 
     def process_weights_after_loading(self, layer):
-        global visit_dyn
-        visit_dyn.add(layer.prefix)
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         # cast quantized weight tensors in NZ format for higher inference speed
         layer.weight.data = maybe_trans_nz(layer.weight.data)
         layer.weight_scale.data = layer.weight_scale.data.flatten()
-        layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
+        weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
+        layer.register_parameter(
+            'weight_scale_fp32',
+            torch.nn.Parameter(weight_scale_fp32, requires_grad=False)
+        )
         layer.weight_offset.data = layer.weight_offset.data.flatten()
 
 
@@ -193,37 +184,6 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         pertoken_scale: Any | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        global visit_fused
-        if is_restore() and layer in visit_fused:
-            layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
-            layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
-            # TODO(zzzzwwjj): Currently, `torch_npu.npu_grouped_matmul_swiglu_quant`
-            # can only support weight nz.
-            layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
-            layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
-            layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(layer.w13_weight_scale.data.shape[0], -1)
-            layer.w13_weight_scale_fp32 = layer.w13_weight_scale.data.to(torch.float32)
-            layer.w13_weight_offset.data = layer.w13_weight_offset.data.view(layer.w13_weight_offset.data.shape[0], -1)
-            layer.w2_weight_scale.data = layer.w2_weight_scale.data.view(layer.w2_weight_scale.data.shape[0], -1)
-            layer.w2_weight_offset.data = layer.w2_weight_offset.data.view(layer.w2_weight_offset.data.shape[0], -1)
-
-            layer.fused_w1_scale = scale_from_float_to_int64(layer.w13_weight_scale.data)
-            layer.fused_w2_scale = scale_from_float_to_int64(layer.w2_weight_scale.data)
-
-            if self.dynamic_eplb:
-                layer.w13_weight_list = [weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)]
-                layer.w2_weight_list = [weight.clone() for weight in layer.w2_weight.data.unbind(dim=0)]
-                layer.w13_weight_scale_fp32_list = [
-                    weight.clone() for weight in layer.w13_weight_scale_fp32.data.unbind(dim=0)
-                ]
-                layer.w2_weight_scale_list = [weight.clone() for weight in layer.w2_weight_scale.data.unbind(dim=0)]
-                del layer.w13_weight
-                del layer.w2_weight
-                del layer.w13_weight_scale
-                del layer.w13_weight_scale_fp32
-                del layer.w2_weight_scale
-                torch.npu.empty_cache()
-            visit_fused.remove(layer)
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
         if zero_expert_num == 0 or zero_expert_type is None:
@@ -309,22 +269,40 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         return final_hidden_states
 
     def process_weights_after_loading(self, layer):
-        global visit_fused
-        visit_fused.add(layer)
+        # 原有的权重处理
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+        
         # TODO(zzzzwwjj): Currently, `torch_npu.npu_grouped_matmul_swiglu_quant`
         # can only support weight nz.
         layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
         layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+        
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(layer.w13_weight_scale.data.shape[0], -1)
-        layer.w13_weight_scale_fp32 = layer.w13_weight_scale.data.to(torch.float32)
+        # layer.w13_weight_scale_fp32 = layer.w13_weight_scale.data.to(torch.float32)
+        w13_weight_scale_fp32 = layer.w13_weight_scale.data.to(torch.float32)
+        layer.register_parameter(
+            'w13_weight_scale_fp32',
+            torch.nn.Parameter(w13_weight_scale_fp32, requires_grad=False)
+        )
         layer.w13_weight_offset.data = layer.w13_weight_offset.data.view(layer.w13_weight_offset.data.shape[0], -1)
         layer.w2_weight_scale.data = layer.w2_weight_scale.data.view(layer.w2_weight_scale.data.shape[0], -1)
         layer.w2_weight_offset.data = layer.w2_weight_offset.data.view(layer.w2_weight_offset.data.shape[0], -1)
 
-        layer.fused_w1_scale = scale_from_float_to_int64(layer.w13_weight_scale.data)
-        layer.fused_w2_scale = scale_from_float_to_int64(layer.w2_weight_scale.data)
+        # 更新注册的参数
+        fused_w1_scale = scale_from_float_to_int64(layer.w13_weight_scale.data)
+        fused_w2_scale = scale_from_float_to_int64(layer.w2_weight_scale.data)
+        
+        
+        # 方法2：重新注册参数（如果需要改变形状或设备）
+        layer.register_parameter(
+            'fused_w1_scale',
+            torch.nn.Parameter(fused_w1_scale, requires_grad=False)
+        )
+        layer.register_parameter(
+            'fused_w2_scale',
+            torch.nn.Parameter(fused_w2_scale, requires_grad=False)
+        )
 
         if self.dynamic_eplb:
             layer.w13_weight_list = [weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)]
