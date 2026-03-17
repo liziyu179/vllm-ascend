@@ -189,7 +189,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
     ):
         # [snapshot] update moe_all_to_all_group_name
         device_group = get_mc2_group().device_group
-        # TODO: Try local_rank = ep_group.rank_in_group
         local_rank = torch.distributed.get_rank(group=device_group)
         backend = device_group._get_backend(torch.device("npu"))
         self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)

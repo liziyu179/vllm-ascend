@@ -2305,12 +2305,14 @@ class NPUModelRunner(GPUModelRunner):
             self.eplb_updator.set_adaptor(self.eplb_adaptor)
             self.eplb_updator.warm_up_eplb()
 
-    def dump_model(self) -> None:
-        model_save_path = "/mnt/snapshot_weight/" + self.vllm_config.model_config.model.rsplit('/', 1)[-1] + "/model_ckpt." + str(self.dp_rank) + "tp"+ str(get_tp_group().rank_in_group) + ".pth"
+    def dump_model(self, path="/mnt") -> None:
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        model_save_path = path + "/snapshot_weight/" + self.vllm_config.model_config.model.rsplit('/', 1)[-1] + "_dp" + str(self.dp_size) + "_tp" + str(tp_size) +"/model_ckpt." + str(self.dp_rank) + "tp"+ str(get_tp_group().rank_in_group) + ".pth"
         logger.info(f"model type is {type(self.model)}")
         if os.path.exists(model_save_path):
+            logger.info(f"model save path {model_save_path} is exists, skip dump model")
             return
-        os.makedirs("/mnt/snapshot_weight/" + self.vllm_config.model_config.model.rsplit('/', 1)[-1], exist_ok=True)
+        os.makedirs(path + "/snapshot_weight/" + self.vllm_config.model_config.model.rsplit('/', 1)[-1]+ "_dp" + str(self.dp_size) + "_tp" + str(tp_size), exist_ok=True)
         logger.info("[dump model] start dump model to %s", model_save_path)
         start = time.time()
         import psutil
@@ -2335,8 +2337,9 @@ class NPUModelRunner(GPUModelRunner):
         elapse = time.time() - start
         logger.info("[dump model] save model ckpt to %s, elapse %.4f s", model_save_path, elapse)
 
-    def restore_model(self) -> None:
-        model_save_path = "/mnt/snapshot_weight/" + self.vllm_config.model_config.model.rsplit('/', 1)[-1] + "/model_ckpt." + str(self.dp_rank) +"tp"+ str(get_tp_group().rank_in_group) + ".pth"
+    def restore_model(self, path="/mnt") -> None:
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        model_save_path = path +"/snapshot_weight/" + self.vllm_config.model_config.model.rsplit('/', 1)[-1]  + "_dp" + str(self.dp_size) + "_tp" + str(tp_size) + "/model_ckpt." + str(self.dp_rank) +"tp"+ str(get_tp_group().rank_in_group) + ".pth"
         start = time.time()
         sd = torch.load(model_save_path, map_location='cpu', mmap=True)
         logger.info(f"[restore model] load model to cpu from {model_save_path}, elapse {time.time() - start}s, the num of items is {len(sd.items())}")
@@ -2345,20 +2348,15 @@ class NPUModelRunner(GPUModelRunner):
         param_dict = dict(self.model.named_parameters())
         buffer_dict = dict(self.model.named_buffers())
         for name, cpu_tensor in sd.items():
-            hit = False
             if name in param_dict:
                 npu_tensor = param_dict[name]
-                print(f"[weight] get parameter {name}!", flush=True)
                 npu_tensor.data.copy_(cpu_tensor)
                 cnt+=1
-                hit = True
 
             if name in buffer_dict:
                 npu_tensor = buffer_dict[name]
-                print(f"[weight] get buffer {name}!", flush=True)
                 npu_tensor.data.copy_(cpu_tensor)
                 cnt+=1
-                hit = True
         
         logger.info(f"replace success {cnt} / {len(sd.items())}")
         elapse = time.time() - start

@@ -28,7 +28,7 @@ from vllm_ascend.utils import (
 
 from .base import AscendLinearScheme
 from .registry import register_scheme
-from vllm.utils import is_restore
+
 
 @register_scheme("W8A8", "linear")
 class AscendW8A8LinearMethod(AscendLinearScheme):

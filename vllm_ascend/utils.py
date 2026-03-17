@@ -672,7 +672,7 @@ def check_ascend_device_type():
     if _ascend_device_type is None:
         _init_ascend_device_type()
 
-    cur_device_type = AscendDeviceType.A3
+    cur_device_type = AscendDeviceType.A2
     # soc_version = torch_npu.npu.get_soc_version()
     # if 220 <= soc_version <= 225:
     #     cur_device_type = AscendDeviceType.A2
