@@ -34,8 +34,6 @@ from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType
 from .registry import register_scheme
-from vllm.utils import is_restore
-
 
 
 def scale_from_float_to_int64(scale):
@@ -269,17 +267,13 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         return final_hidden_states
 
     def process_weights_after_loading(self, layer):
-        # 原有的权重处理
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
-        
         # TODO(zzzzwwjj): Currently, `torch_npu.npu_grouped_matmul_swiglu_quant`
         # can only support weight nz.
         layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
         layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
-        
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(layer.w13_weight_scale.data.shape[0], -1)
-        # layer.w13_weight_scale_fp32 = layer.w13_weight_scale.data.to(torch.float32)
         w13_weight_scale_fp32 = layer.w13_weight_scale.data.to(torch.float32)
         layer.register_parameter(
             'w13_weight_scale_fp32',
@@ -293,8 +287,6 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         fused_w1_scale = scale_from_float_to_int64(layer.w13_weight_scale.data)
         fused_w2_scale = scale_from_float_to_int64(layer.w2_weight_scale.data)
         
-        
-        # 方法2：重新注册参数（如果需要改变形状或设备）
         layer.register_parameter(
             'fused_w1_scale',
             torch.nn.Parameter(fused_w1_scale, requires_grad=False)
