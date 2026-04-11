@@ -1,5 +1,6 @@
 # mypy: ignore-errors
 # SPDX-License-Identifier: Apache-2.0
+import asyncio
 import contextlib
 import copy
 import hashlib
@@ -11,7 +12,6 @@ import threading
 import time
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -229,7 +229,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.resharding_stream = resharding_stream
         self.current_layer = -1
 
-        self.send_queue = queue.Queue[SendTask]()
+        self.send_queue = queue.SimpleQueue[SendTask]()
         self.k_buffer = k_buffer
         self.v_buffer = v_buffer
         self.ready_event = ready_event
@@ -669,7 +669,6 @@ class MooncakeLayerwiseConnectorScheduler:
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[str, tuple[Request, list[int], list[list[int]]]] = {}
         self._reqs_need_send_layerwise: dict[str, SendReqInfo] = {}
-        self.executor = ThreadPoolExecutor(32)
         tls_config: dict[str, Any] = vllm_config.kv_transfer_config.get_from_extra_config("tls_config", {})
         ssl_keyfile = tls_config.get("ssl_keyfile")
         ssl_certfile = tls_config.get("ssl_certfile")
@@ -678,12 +677,28 @@ class MooncakeLayerwiseConnectorScheduler:
         self.cert_path = (ssl_certfile, ssl_keyfile, ssl_keyfile_password)
         self.ssl_enable = tls_config.get("ssl_enable", False)
         self.ca_path = ssl_ca_certs
+        self.metaserver_client_kwargs: dict[str, Any] = {
+            "limits": httpx.Limits(max_connections=100000),
+            "timeout": None,
+        }
         if self.ssl_enable:
-            self.metaserver_client = httpx.Client(
-                limits=httpx.Limits(max_connections=100000), timeout=None, cert=self.cert_path, verify=self.ca_path
+            self.metaserver_client_kwargs.update(
+                {
+                    "cert": self.cert_path,
+                    "verify": self.ca_path,
+                }
             )
-        else:
-            self.metaserver_client = httpx.Client(limits=httpx.Limits(max_connections=100000), timeout=None)
+        self.metaserver_loop: asyncio.AbstractEventLoop | None = None
+        self.metaserver_async_queue: asyncio.Queue[tuple[str, str, dict[str, Any]]] | None = None
+        self.metaserver_pending_tasks: set[asyncio.Task[Any]] = set()
+        self.metaserver_loop_ready = threading.Event()
+        self.metaserver_loop_thread = threading.Thread(
+            target=self._run_metaserver_loop,
+            name=f"MooncakeMetaServerLoop-{engine_id}",
+            daemon=True,
+        )
+        self.metaserver_loop_thread.start()
+        self.metaserver_loop_ready.wait()
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         """
@@ -762,15 +777,11 @@ class MooncakeLayerwiseConnectorScheduler:
                 remote_cached_tokens=remote_cached_tokens,
             )
 
-            future = self.executor.submit(
-                self._access_metaserver, url=params.get("metaserver", None), message=kv_transfer_params
+            self._enqueue_metaserver_request(
+                request_id=request.request_id,
+                url=params.get("metaserver", None),
+                message=kv_transfer_params,
             )
-
-            def handle_exception(future):
-                if future.exception():
-                    logger.error(f"Access metaserver fail: {future.exception()}")
-
-            future.add_done_callback(handle_exception)
 
         # Layerwise prefiller add request need send
         if params is not None and params.get("do_remote_decode"):
@@ -871,13 +882,64 @@ class MooncakeLayerwiseConnectorScheduler:
                         self._reqs_need_send_layerwise.pop(req_id)
         return meta
 
-    def _access_metaserver(self, url, message):
+    def _enqueue_metaserver_request(self, request_id: str, url: str | None, message: dict[str, Any]) -> None:
+        if not url:
+            logger.error("Metaserver url is empty for request %s", request_id)
+            return
+        assert self.metaserver_loop is not None
+        assert self.metaserver_async_queue is not None
+        self.metaserver_loop.call_soon_threadsafe(
+            self.metaserver_async_queue.put_nowait, (request_id, url, message)
+        )
+
+    def _run_metaserver_loop(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self.metaserver_loop = loop
+        self.metaserver_async_queue = asyncio.Queue()
+        self.metaserver_loop_ready.set()
+        loop.create_task(self._metaserver_dispatch_loop())
+        loop.run_forever()
+
+    async def _metaserver_dispatch_loop(self) -> None:
+        assert self.metaserver_async_queue is not None
+        async with httpx.AsyncClient(**self.metaserver_client_kwargs) as client:
+            while True:
+                request_id, url, message = await self.metaserver_async_queue.get()
+                task = asyncio.create_task(
+                    self._post_metaserver_request(client=client, request_id=request_id, url=url, message=message),
+                    name=f"metaserver-post-{request_id}",
+                )
+                self.metaserver_pending_tasks.add(task)
+                task.add_done_callback(self._on_metaserver_post_done)
+
+    def _on_metaserver_post_done(self, task: asyncio.Task[Any]) -> None:
+        self.metaserver_pending_tasks.discard(task)
+        try:
+            task.result()
+        except Exception:
+            # Exceptions are logged in _post_metaserver_request.
+            pass
+
+    async def _post_metaserver_request(
+        self,
+        client: httpx.AsyncClient,
+        request_id: str,
+        url: str,
+        message: dict[str, Any],
+    ) -> None:
+        try:
+            await self._access_metaserver(client=client, url=url, message=message)
+        except Exception as e:
+            logger.error("Access metaserver fail for request %s: %s", request_id, e)
+
+    async def _access_metaserver(self, client: httpx.AsyncClient, url: str, message: dict[str, Any]):
         success = False
         retry = 0
         while retry < 3 and success is False:
             retry += 1
             try:
-                self.metaserver_client.post(url, json=message)
+                await client.post(url, json=message)
                 success = True
             except Exception as e:
                 logger.error(f"Failed to connect to metaserver: {url}, retry {retry} time.")
@@ -921,6 +983,8 @@ class MooncakeLayerwiseConnectorWorker:
 
         # Metadata.
         self.vllm_config = vllm_config
+        self.is_kv_producer = self.vllm_config.kv_transfer_config.is_kv_producer
+        self.is_kv_consumer = self.vllm_config.kv_transfer_config.is_kv_consumer
         self.kv_cache_config = kv_cache_config
         self.num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
         self.kv_cache_specs: list[KVCacheSpec] = [spec.kv_cache_spec for spec in self.kv_cache_config.kv_cache_groups]
@@ -985,6 +1049,20 @@ class MooncakeLayerwiseConnectorWorker:
         self.timeout = 1.0  # seconds
         self.k_buffer: torch.Tensor | None = None
         self.v_buffer: torch.Tensor | None = None
+        self.layerwise_send_queue = asyncio.Queue[SendTask]()
+        
+        self.sender_loop = asyncio.new_event_loop()
+        self._sender_listener_t = threading.Thread(
+                target=_async_loop, args=(self.sender_loop,), daemon=True
+            )
+        self._sender_listener_t.start()
+
+        if self.is_kv_producer:
+            # TODO add push thread
+            # logger.info(f"[===] _mooncake_layerwise_sender start")
+            asyncio.run_coroutine_threadsafe(
+                self._mooncake_layerwise_sender(), self.sender_loop
+            )
 
     def create_kv_buffer(self, first_kv_cache):
         if self.pd_head_ratio > 1:
@@ -1116,28 +1194,30 @@ class MooncakeLayerwiseConnectorWorker:
             layer_metadata=self.layer_metadata,
         )
         if self.vllm_config.kv_transfer_config.is_kv_producer:
-            ready_event = threading.Event()
-            self.kv_send_layer_thread = KVCacheSendingLayerThread(
-                engine=self.engine,
-                vllm_config=self.vllm_config,
-                kv_cache_config=self.kv_cache_config,
-                kv_cache_specs=self.kv_cache_specs,
-                attn_resharding_group_idx=self.attn_resharding_group_idx,
-                total_layers=self.total_layers,
-                ready_event=ready_event,
-                tp_size=self.tp_size,
-                tp_rank=self.tp_rank,
-                pd_head_ratio=self.pd_head_ratio,
-                num_head_replica=self.num_head_replica,
-                layer_metadata=self.layer_metadata,
-                use_mla=self.use_mla,
-                k_buffer=self.k_buffer,
-                v_buffer=self.v_buffer,
-                resharding_stream=self.resharding_stream,
-                callback_func=self.send_done_send_signal,
-            )
-            self.kv_send_layer_thread.start()
-            ready_event.wait()
+            # ready_event = threading.Event()
+            # self.kv_send_layer_thread = KVCacheSendingLayerThread(
+            #     engine=self.engine,
+            #     vllm_config=self.vllm_config,
+            #     kv_cache_config=self.kv_cache_config,
+            #     kv_cache_specs=self.kv_cache_specs,
+            #     attn_resharding_group_idx=self.attn_resharding_group_idx,
+            #     total_layers=self.total_layers,
+            #     ready_event=ready_event,
+            #     tp_size=self.tp_size,
+            #     tp_rank=self.tp_rank,
+            #     pd_head_ratio=self.pd_head_ratio,
+            #     num_head_replica=self.num_head_replica,
+            #     layer_metadata=self.layer_metadata,
+            #     use_mla=self.use_mla,
+            #     k_buffer=self.k_buffer,
+            #     v_buffer=self.v_buffer,
+            #     resharding_stream=self.resharding_stream,
+            #     callback_func=self.send_done_send_signal,
+            # )
+            # self.kv_send_layer_thread.start()
+            # ready_event.wait()
+            self.send_queue = queue.SimpleQueue[SendTask]()
+            self.callback_func = self.send_done_send_signal
 
         if self.vllm_config.kv_transfer_config.is_kv_consumer:
             ready_event = threading.Event()
@@ -1490,7 +1570,7 @@ class MooncakeLayerwiseConnectorWorker:
                     values = values.reshape(-1, *kv_layer[1].shape[2:])
                     (keys, values) = kv_alltoall_and_rearrange(self.pd_head_ratio, keys, values)
 
-            assert self.kv_send_layer_thread is not None
+            # assert self.kv_send_layer_thread is not None
             assert reshape_cache_event is not None
             layer_send_task = SendTask(
                 wait_event=reshape_cache_event,
@@ -1507,8 +1587,207 @@ class MooncakeLayerwiseConnectorWorker:
                 logger.debug(f"Add request {req_id} to kv send layer thread. {req_meta_update=}")
                 layer_send_task.send_request[req_id] = req_meta_update
 
-            self.kv_send_layer_thread.send_queue.put(layer_send_task)
+            # self.kv_send_layer_thread.send_queue.put(layer_send_task)
+            self.sender_loop.call_soon_threadsafe(
+                self.layerwise_send_queue.put_nowait, layer_send_task
+            )
             self.current_layer += 1
+
+    async def _mooncake_layerwise_sender(self):
+        """
+        Background thread that listens for Mooncake requests, dispatches them
+        to a thread pool, and sends acknowledgments upon completion.
+        """
+        # logger.info(f"MooncakeConnector _mooncake_layerwise_sender start")
+        while True:
+            send_task = await self.layerwise_send_queue.get()
+            logger.debug(f"MooncakeConnector _mooncake_layerwise_sender get {send_task.send_request.keys()}")
+            self._handle_request(send_task)
+    
+    def _handle_request(self, send_task: SendTask):
+        try:
+            self._transfer_kv_cache(send_task)
+        except Exception as e:
+            logger.error(f"Failed to transfer KV cache for layer idx {send_task.layer_idx}, {e}")
+
+    def get_transfer_meta(self, send_task: SendTask, req_id: str, req_meta: ReqMeta, layer_group_idx: int):
+        src_list: list[int] = []
+        dst_list: list[int] = []
+        length_list: list[int] = []
+
+        layer_name = send_task.layer_name
+        layer_kv_cache_spec = self.kv_cache_specs[layer_group_idx]
+        remote_block_ids = req_meta.remote_block_ids[layer_group_idx]
+        remote_layer_metadata = req_meta.remote_layer_metadata[layer_name]
+        local_layer_metadata = self.layer_metadata[layer_name]
+        local_block_ids = req_meta.local_block_ids[layer_group_idx]
+
+        if isinstance(layer_kv_cache_spec, MambaSpec):
+            # only support one block transfer for mamba
+            local_conv_addr, local_ssm_addr = local_layer_metadata.kv_caches_base_addr
+            remote_conv_addr, remote_ssm_addr = remote_layer_metadata.kv_caches_base_addr
+            local_conv_len, local_ssm_len = local_layer_metadata.block_len
+            tp_ratio = self.tp_size // req_meta.remote_tp_size
+            if tp_ratio == 1:
+                src_list.extend(
+                    [
+                        local_conv_addr + local_block_ids[0] * local_conv_len,
+                        local_ssm_addr + local_block_ids[0] * local_ssm_len,
+                    ]
+                )
+                dst_list.extend(
+                    [
+                        remote_conv_addr + remote_block_ids[0] * local_conv_len,
+                        remote_ssm_addr + remote_block_ids[0] * local_ssm_len,
+                    ]
+                )
+                length_list.extend([local_conv_len, local_ssm_len])
+            else:
+                conv_shape, ssm_shape = layer_kv_cache_spec.shapes
+                conv_dtype, ssm_dtype = layer_kv_cache_spec.dtypes
+                remote_conv_len, remote_ssm_len = remote_layer_metadata.block_len
+                # conv
+                linear_key_head_dim = self.vllm_config.model_config.hf_text_config.linear_key_head_dim
+                linear_num_key_heads = self.vllm_config.model_config.hf_text_config.linear_num_key_heads
+                linear_value_head_dim = self.vllm_config.model_config.hf_text_config.linear_value_head_dim
+                linear_num_value_heads = self.vllm_config.model_config.hf_text_config.linear_num_value_heads
+                local_num_key_heads = linear_num_key_heads // self.tp_size
+                local_num_value_heads = linear_num_value_heads // self.tp_size
+                local_conv_offsets = [
+                    0,
+                    local_num_key_heads * linear_key_head_dim,
+                    local_num_key_heads * 2 * linear_key_head_dim,
+                ]
+                local_conv_sizes = [
+                    local_num_key_heads * linear_key_head_dim,
+                    local_num_key_heads * linear_key_head_dim,
+                    local_num_value_heads * linear_value_head_dim,
+                ]
+                for i in range(conv_shape[0]):
+                    for local_conv_offset, local_conv_size in zip(local_conv_offsets, local_conv_sizes):
+                        local_addr_offset = (i * conv_shape[1] + local_conv_offset) * get_dtype_size(conv_dtype)
+                        remote_addr_offset = (
+                            (i * conv_shape[1] * tp_ratio) + (self.tp_rank % tp_ratio) * local_conv_size
+                        ) * get_dtype_size(conv_dtype)
+                        src_list.append(local_conv_addr + local_block_ids[0] * local_conv_len + local_addr_offset)
+                        dst_list.append(remote_conv_addr + remote_block_ids[0] * remote_conv_len + remote_addr_offset)
+                        length_list.append(local_conv_size * get_dtype_size(conv_dtype))
+                # ssm
+                remote_addr_offset = (self.tp_rank % tp_ratio) * math.prod(ssm_shape) * get_dtype_size(ssm_dtype)
+                src_list.append(local_ssm_addr + local_block_ids[0] * local_ssm_len)
+                dst_list.append(remote_ssm_addr + remote_block_ids[0] * remote_ssm_len + remote_addr_offset)
+                length_list.append(local_ssm_len)
+        else:
+            if self.pd_head_ratio == 1:
+                layer_local_kv_base_addr = local_layer_metadata.kv_caches_base_addr
+                layer_remote_kv_base_addr = remote_layer_metadata.kv_caches_base_addr
+                block_lens = local_layer_metadata.block_len
+                grouped_remote_block_ids, grouped_local_block_ids = group_concurrent_contiguous(
+                    remote_block_ids, local_block_ids
+                )
+                for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
+                    zip(layer_local_kv_base_addr, layer_remote_kv_base_addr)
+                ):
+                    block_len = block_lens[k]
+                    for group_remote_block_id, group_local_block_id in zip(
+                        grouped_remote_block_ids, grouped_local_block_ids
+                    ):
+                        src = src_layer_base_addr + group_local_block_id[0] * block_len
+                        dst = dst_layer_base_addr + group_remote_block_id[0] * block_len
+                        length = len(group_local_block_id) * block_len
+                        src_list.append(src)
+                        dst_list.append(dst)
+                        length_list.append(length)
+            else:
+                rearrange_block_ids = send_task.group_rearrange_block_ids[layer_group_idx]
+                rearrange_block_dict = {
+                    value: index
+                    for index, value in enumerate(rearrange_block_ids)  # type:ignore
+                }
+                layer_local_kv_base_addr = [self.k_buffer.data_ptr(), self.v_buffer.data_ptr()]
+                layer_remote_kv_base_addr = remote_layer_metadata.kv_caches_base_addr
+                block_lens = local_layer_metadata.block_len
+                remote_block_lens = remote_layer_metadata.block_len
+                assert len(layer_remote_kv_base_addr) == 2, (
+                    "Layer kv_cache resharding only supports two kv cache tensors."
+                )
+                src_list, dst_list, length_list = [], [], []
+                for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
+                    zip(layer_local_kv_base_addr, layer_remote_kv_base_addr)
+                ):
+                    block_len = block_lens[k]
+                    remote_block_len = remote_block_lens[k]
+                    for remote_block_id, local_block_id in zip(remote_block_ids, local_block_ids):
+                        src = src_layer_base_addr + rearrange_block_dict[local_block_id] * block_len
+                        dst = (
+                            dst_layer_base_addr
+                            + remote_block_id * remote_block_len
+                            + block_len * ((self.tp_rank // self.num_head_replica) % self.pd_head_ratio)
+                        )
+                        src_list.append(src)
+                        dst_list.append(dst)
+                        length_list.append(block_len)
+        return (src_list, dst_list, length_list)
+
+    def _transfer_kv_cache(self, send_task: SendTask):
+        layer_name = send_task.layer_name
+        layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
+        key = send_task.k_cache
+        value = send_task.v_cache
+        if self.pd_head_ratio > 1 and key is not None and value is not None:
+            with npu_stream_switch(self.resharding_stream):
+                key = key.view(-1, key.shape[-1])  # type:ignore
+                value = value.view(-1, key.shape[-1])  # type:ignore
+                self.k_buffer[: key.shape[0]].copy_(key)  # [:4, 128] ->
+                self.v_buffer[: value.shape[0]].copy_(value)
+
+        # Merge transmission tasks of the same session
+        session_meta: dict[str, TransferMeta] = {}
+        for req_id, req_meta in send_task.send_request.items():
+            session_id = f"{req_meta.remote_host}:{req_meta.remote_te_rpc_port}"
+            if session_id not in session_meta:
+                session_meta[session_id] = TransferMeta(src=[], dst=[], length=[], req_ids=[])
+
+            (src_list, dst_list, length_list) = self.get_transfer_meta(send_task, req_id, req_meta, layer_group_idx)
+
+            session_meta[session_id].src.extend(src_list)
+            session_meta[session_id].dst.extend(dst_list)
+            session_meta[session_id].length.extend(length_list)
+            session_meta[session_id].req_ids.append(req_id)
+
+        if self.pd_head_ratio == 1:
+            """
+            Note: Due to a bug in ADXL, calling current_event.synchronize() may occasionally hang.
+            This issue will be fixed in CANN version 8.5.rc1.
+            You can manually build the master branch of the project at https://gitcode.com/cann/hixl
+            to resolve this issue before the 8.5.RC1 release.
+            """
+            send_task.wait_event.synchronize()  # type:ignore
+        elif self.pd_head_ratio > 1:
+            self.resharding_stream.synchronize()
+
+        for session_id, transfer_meta in session_meta.items():
+            if len(transfer_meta.src) > 0:
+                ret = self.engine.batch_transfer_sync_write(
+                    session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
+                )
+                if ret < 0:
+                    logger.error(
+                        f"Mooncake transfer failed for send requests {transfer_meta.req_ids} kv cache to {session_id}"
+                    )
+                    if send_task.layer_idx == (self.total_layers - 1):
+                        for req_id in transfer_meta.req_ids:
+                            req_meta = send_task.send_request[req_id]
+                            if req_meta.chunk_finish:
+                                self.callback_func(
+                                    req_id, req_meta, layer_group_idx
+                                )  # TODO Send a signal indicating transmission failure
+                else:
+                    if send_task.layer_idx == (self.total_layers - 1):
+                        for req_id in transfer_meta.req_ids:
+                            req_meta = send_task.send_request[req_id]
+                            if req_meta.chunk_finish:
+                                self.callback_func(req_id, req_meta, layer_group_idx)
 
     def _get_remote_socket(self, remote_host: str, remote_handshake_port: int) -> zmq.Socket:  # type: ignore
         """Get a socket to the remote host."""
@@ -1713,3 +1992,7 @@ def get_external_request_id(request_id: str):
     # NOTE(zxr): vLLM PR #27987 add additional suffix
     # to EngineCore request_id with len(suffix) == 9
     return request_id[:-9]
+
+def _async_loop(loop: asyncio.AbstractEventLoop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
