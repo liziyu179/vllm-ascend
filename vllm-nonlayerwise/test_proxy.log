@@ -1,0 +1,307 @@
+INFO:     Started server process [465205]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://90.90.97.27:8900 (Press CTRL+C to quit)
+Got 1 prefill clients and 1 decode clients.
+Inited prefiller http://90.90.97.27:30050 with dp_size=2
+All prefiller instances are ready.
+[+++] proxy get req 13930b81-cb6f-4966-af41-9503a13a6265 1775995175625
+INFO:     90.90.97.27:51660 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 13930b81-cb6f-4966-af41-9503a13a6265 1775995176278
+[+++] proxy get req f7006583-068c-424b-b372-341283341027 1775995176280
+INFO:     90.90.97.27:47290 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back f7006583-068c-424b-b372-341283341027 1775995177277
+[+++] proxy get req f7e44d82-ff85-4277-8891-1a13bc061dd1 1775995177279
+INFO:     90.90.97.27:47300 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back f7e44d82-ff85-4277-8891-1a13bc061dd1 1775995177991
+[+++] proxy get req d94cfdd8-a95d-4f9e-ab9b-8db6db862a0e 1775995177993
+INFO:     90.90.97.27:47308 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back d94cfdd8-a95d-4f9e-ab9b-8db6db862a0e 1775995178403
+[+++] proxy get req af2ee04c-4455-4b4c-a6a8-fc80ad23a1d8 1775995178404
+INFO:     90.90.97.27:47314 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back af2ee04c-4455-4b4c-a6a8-fc80ad23a1d8 1775995178694
+[+++] proxy get req 7f9a8911-c9cb-42e4-a9eb-0b3e4dd22bd4 1775995178695
+INFO:     90.90.97.27:47324 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 7f9a8911-c9cb-42e4-a9eb-0b3e4dd22bd4 1775995178970
+[+++] proxy get req 96100015-5769-4cfa-86ee-e758c21dc4bb 1775995178972
+INFO:     90.90.97.27:47326 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 96100015-5769-4cfa-86ee-e758c21dc4bb 1775995179263
+[+++] proxy get req 29b13ed0-cdb0-4544-a007-603a06fe71fd 1775995179265
+INFO:     90.90.97.27:47330 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 29b13ed0-cdb0-4544-a007-603a06fe71fd 1775995179523
+[+++] proxy get req 440fdd7a-b746-442a-b4b2-36f184466ae2 1775995179525
+INFO:     90.90.97.27:47344 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 440fdd7a-b746-442a-b4b2-36f184466ae2 1775995179830
+[+++] proxy get req c6e0723d-d580-4631-85dc-4c1be4bb6ffc 1775995179831
+INFO:     90.90.97.27:47354 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back c6e0723d-d580-4631-85dc-4c1be4bb6ffc 1775995180105
+[+++] proxy get req c4945899-106d-4a87-aa69-dc43d145650a 1775995180107
+INFO:     90.90.97.27:47366 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back c4945899-106d-4a87-aa69-dc43d145650a 1775995180382
+[+++] proxy get req 2c2602c3-7694-46b3-8eef-345daa7c8166 1775995180383
+INFO:     90.90.97.27:47382 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 2c2602c3-7694-46b3-8eef-345daa7c8166 1775995180658
+[+++] proxy get req eda3b7b4-8f1a-4475-959a-d2ea299bdf3a 1775995180659
+INFO:     90.90.97.27:47396 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back eda3b7b4-8f1a-4475-959a-d2ea299bdf3a 1775995180965
+[+++] proxy get req fda26d30-7de6-4567-8e5c-894729276504 1775995180966
+INFO:     90.90.97.27:47404 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back fda26d30-7de6-4567-8e5c-894729276504 1775995181240
+[+++] proxy get req 05bd69f7-e7ed-424d-8790-14aac4526749 1775995181241
+INFO:     90.90.97.27:47418 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 05bd69f7-e7ed-424d-8790-14aac4526749 1775995181531
+[+++] proxy get req e9b1d008-f9a4-4bf5-afda-b803d05245b6 1775995181533
+INFO:     90.90.97.27:47426 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back e9b1d008-f9a4-4bf5-afda-b803d05245b6 1775995181806
+[+++] proxy get req 44d97450-215a-4f39-8c2e-4fe0587fea0e 1775995181807
+INFO:     90.90.97.27:47434 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 44d97450-215a-4f39-8c2e-4fe0587fea0e 1775995182097
+[+++] proxy get req 2572e852-9fd1-4c0f-9f5c-b4d5ce27e78c 1775995182099
+INFO:     90.90.97.27:47444 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 2572e852-9fd1-4c0f-9f5c-b4d5ce27e78c 1775995182357
+[+++] proxy get req 0f03f94b-859b-4929-99c6-a8428d3e23b9 1775995182358
+INFO:     90.90.97.27:47450 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 0f03f94b-859b-4929-99c6-a8428d3e23b9 1775995182648
+[+++] proxy get req 0034a0f4-7731-45ab-9634-c4c680f2bd4a 1775995182650
+INFO:     90.90.97.27:47456 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 0034a0f4-7731-45ab-9634-c4c680f2bd4a 1775995182926
+[+++] proxy get req b8faf8e9-18d0-43a6-a0d9-aa97e2d4f2fd 1775995182927
+INFO:     90.90.97.27:47468 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back b8faf8e9-18d0-43a6-a0d9-aa97e2d4f2fd 1775995183217
+[+++] proxy get req d4dfd83c-a5e9-4d81-aa2c-ae7bc12105ae 1775995183219
+INFO:     90.90.97.27:47478 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back d4dfd83c-a5e9-4d81-aa2c-ae7bc12105ae 1775995183481
+[+++] proxy get req 683e56ae-4fa7-4326-ac63-101afec66d7f 1775995183482
+INFO:     90.90.97.27:47488 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 683e56ae-4fa7-4326-ac63-101afec66d7f 1775995183772
+[+++] proxy get req 465ad080-4935-4a1a-af46-2e8789625b1e 1775995183773
+INFO:     90.90.97.27:47490 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 465ad080-4935-4a1a-af46-2e8789625b1e 1775995184048
+[+++] proxy get req 73707f8c-122b-4161-b72c-4a478bf42254 1775995184049
+INFO:     90.90.97.27:47506 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 73707f8c-122b-4161-b72c-4a478bf42254 1775995184330
+[+++] proxy get req 279d7838-026c-4ed2-ae60-d1822ecc116a 1775995184331
+INFO:     90.90.97.27:47520 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 279d7838-026c-4ed2-ae60-d1822ecc116a 1775995184606
+[+++] proxy get req 13ca55bc-51db-4c42-9109-319d1bbcfee9 1775995184607
+INFO:     90.90.97.27:47526 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 13ca55bc-51db-4c42-9109-319d1bbcfee9 1775995184882
+[+++] proxy get req 3698d3ee-0107-4ab8-b84d-ff19921ee551 1775995184883
+INFO:     90.90.97.27:47536 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 3698d3ee-0107-4ab8-b84d-ff19921ee551 1775995185159
+[+++] proxy get req acf3283e-413a-4234-bf71-44aecb4d5657 1775995185160
+INFO:     90.90.97.27:47538 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back acf3283e-413a-4234-bf71-44aecb4d5657 1775995185421
+[+++] proxy get req 4a6659b0-31a7-4a2f-b3ba-e92355a32160 1775995185422
+INFO:     90.90.97.27:47550 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 4a6659b0-31a7-4a2f-b3ba-e92355a32160 1775995185712
+[+++] proxy get req d18dcf4b-907e-42bc-83f4-ab7907d1b77b 1775995185714
+INFO:     90.90.97.27:47564 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back d18dcf4b-907e-42bc-83f4-ab7907d1b77b 1775995185989
+[+++] proxy get req a77c7aab-5f06-4a66-88f9-ccd792a148a6 1775995185990
+INFO:     90.90.97.27:47574 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back a77c7aab-5f06-4a66-88f9-ccd792a148a6 1775995186265
+[+++] proxy get req 72654842-1466-417a-bb36-95af4601d055 1775995186266
+INFO:     90.90.97.27:32876 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 72654842-1466-417a-bb36-95af4601d055 1775995186542
+[+++] proxy get req 22840af8-bcd8-4504-aa32-8ee2f2995c4f 1775995186544
+INFO:     90.90.97.27:32890 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 22840af8-bcd8-4504-aa32-8ee2f2995c4f 1775995186818
+[+++] proxy get req 59c554d6-2283-4cd3-8005-41a904162cf0 1775995186820
+INFO:     90.90.97.27:32902 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 59c554d6-2283-4cd3-8005-41a904162cf0 1775995187095
+[+++] proxy get req 2a854b51-4754-4b28-8ebf-9d5df068ee2e 1775995187097
+INFO:     90.90.97.27:32918 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 2a854b51-4754-4b28-8ebf-9d5df068ee2e 1775995187371
+[+++] proxy get req a24928c5-d2be-48cc-9d32-b67a9231e818 1775995187373
+INFO:     90.90.97.27:32934 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back a24928c5-d2be-48cc-9d32-b67a9231e818 1775995187663
+[+++] proxy get req 02e072c4-a6f8-46ef-875a-0a36faeb04f2 1775995187665
+INFO:     90.90.97.27:32950 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 02e072c4-a6f8-46ef-875a-0a36faeb04f2 1775995187939
+[+++] proxy get req 22a84266-8727-4048-9274-1aea1630f26c 1775995187941
+INFO:     90.90.97.27:32958 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 22a84266-8727-4048-9274-1aea1630f26c 1775995188215
+[+++] proxy get req f8054b1c-1bb8-4abf-9a17-ecb395e25cde 1775995188217
+INFO:     90.90.97.27:32962 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back f8054b1c-1bb8-4abf-9a17-ecb395e25cde 1775995188476
+[+++] proxy get req f6399f1f-f7a4-44ed-b907-957a75eb1645 1775995188478
+INFO:     90.90.97.27:32964 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back f6399f1f-f7a4-44ed-b907-957a75eb1645 1775995188775
+[+++] proxy get req f67f8312-3de6-468c-a849-7066fe29c548 1775995188776
+INFO:     90.90.97.27:32978 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back f67f8312-3de6-468c-a849-7066fe29c548 1775995189036
+[+++] proxy get req c7765331-6f78-478d-8be8-2384a9566076 1775995189037
+INFO:     90.90.97.27:32990 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back c7765331-6f78-478d-8be8-2384a9566076 1775995189312
+[+++] proxy get req 5023ef4b-4b14-4b05-9981-9360db072a3d 1775995189314
+INFO:     90.90.97.27:33000 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 5023ef4b-4b14-4b05-9981-9360db072a3d 1775995189589
+[+++] proxy get req 941f3240-5925-4241-a206-d81d9a89d25e 1775995189590
+INFO:     90.90.97.27:33004 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 941f3240-5925-4241-a206-d81d9a89d25e 1775995189880
+[+++] proxy get req 341d4b02-a083-40e3-9c74-0b16bae40197 1775995189881
+INFO:     90.90.97.27:33006 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 341d4b02-a083-40e3-9c74-0b16bae40197 1775995190188
+[+++] proxy get req b49f507c-6443-490b-b63a-a49c9f114140 1775995190189
+INFO:     90.90.97.27:33012 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back b49f507c-6443-490b-b63a-a49c9f114140 1775995190465
+[+++] proxy get req baadd717-d45d-4919-a9b5-b143c2230908 1775995190466
+INFO:     90.90.97.27:33026 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back baadd717-d45d-4919-a9b5-b143c2230908 1775995190741
+[+++] proxy get req fecfa897-2d42-4ee2-a459-bcfddc025e0c 1775995190743
+INFO:     90.90.97.27:33040 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back fecfa897-2d42-4ee2-a459-bcfddc025e0c 1775995191019
+[+++] proxy get req a66a3c3c-7fa8-434a-9f93-5ca2ad929036 1775995191020
+INFO:     90.90.97.27:33046 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back a66a3c3c-7fa8-434a-9f93-5ca2ad929036 1775995191281
+[+++] proxy get req d394d20a-8c65-433a-9f60-363fccc5353f 1775995191282
+INFO:     90.90.97.27:33056 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back d394d20a-8c65-433a-9f60-363fccc5353f 1775995191558
+[+++] proxy get req c0792187-3d97-4103-a81c-c5d2296ccef6 1775995191559
+INFO:     90.90.97.27:33066 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back c0792187-3d97-4103-a81c-c5d2296ccef6 1775995191835
+[+++] proxy get req 17d0a606-2b5c-4436-8ad8-ab89e8c1c35f 1775995191836
+INFO:     90.90.97.27:33074 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 17d0a606-2b5c-4436-8ad8-ab89e8c1c35f 1775995192113
+[+++] proxy get req be685634-0b62-4c5b-af7b-205a0cce9f83 1775995192114
+INFO:     90.90.97.27:33084 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back be685634-0b62-4c5b-af7b-205a0cce9f83 1775995192375
+[+++] proxy get req 28477a0e-7114-4497-a114-884aa5775125 1775995192376
+INFO:     90.90.97.27:33096 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 28477a0e-7114-4497-a114-884aa5775125 1775995192668
+[+++] proxy get req 55e4c0cc-08e2-4505-84a5-0822291f0efe 1775995192669
+INFO:     90.90.97.27:33102 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 55e4c0cc-08e2-4505-84a5-0822291f0efe 1775995192943
+[+++] proxy get req 21bd04ab-bc50-4fd5-afa9-cabbaaf29ee9 1775995192944
+INFO:     90.90.97.27:33118 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 21bd04ab-bc50-4fd5-afa9-cabbaaf29ee9 1775995193219
+[+++] proxy get req d4afdf1e-21b9-491e-b875-db394c80301e 1775995193220
+INFO:     90.90.97.27:33122 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back d4afdf1e-21b9-491e-b875-db394c80301e 1775995193481
+[+++] proxy get req 21e8a789-b8f4-479d-97da-91bd18c72b29 1775995193482
+INFO:     90.90.97.27:33134 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 21e8a789-b8f4-479d-97da-91bd18c72b29 1775995193774
+[+++] proxy get req 79900d93-fa3b-43f5-a3a6-53f54db4536f 1775995193775
+INFO:     90.90.97.27:33146 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 79900d93-fa3b-43f5-a3a6-53f54db4536f 1775995194034
+[+++] proxy get req 9b8d1bac-1971-4e60-96e9-53e8f5c87d59 1775995194035
+INFO:     90.90.97.27:33162 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 9b8d1bac-1971-4e60-96e9-53e8f5c87d59 1775995194313
+[+++] proxy get req 5e6f1ac8-5e03-4230-94a1-88cad980d7a5 1775995194314
+INFO:     90.90.97.27:33172 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 5e6f1ac8-5e03-4230-94a1-88cad980d7a5 1775995194574
+[+++] proxy get req 96aafa2f-64a0-4175-b35c-9537680808ae 1775995194575
+INFO:     90.90.97.27:33180 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 96aafa2f-64a0-4175-b35c-9537680808ae 1775995194866
+[+++] proxy get req 0005fd3e-3948-4dae-a411-5d2c492be546 1775995194867
+INFO:     90.90.97.27:33192 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 0005fd3e-3948-4dae-a411-5d2c492be546 1775995195127
+[+++] proxy get req 3185552a-ffc2-4025-9959-cdff489265de 1775995195128
+INFO:     90.90.97.27:33194 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 3185552a-ffc2-4025-9959-cdff489265de 1775995195418
+[+++] proxy get req f2e32c26-ef52-4175-8c45-20c5738248cd 1775995195420
+INFO:     90.90.97.27:33208 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back f2e32c26-ef52-4175-8c45-20c5738248cd 1775995195695
+[+++] proxy get req 3c779c18-8122-480c-aaf1-885e7470cd59 1775995195697
+INFO:     90.90.97.27:33222 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 3c779c18-8122-480c-aaf1-885e7470cd59 1775995195984
+[+++] proxy get req a9c98cf0-192d-44ae-bc75-952eab2e1762 1775995195986
+INFO:     90.90.97.27:33230 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back a9c98cf0-192d-44ae-bc75-952eab2e1762 1775995196246
+[+++] proxy get req f71f9555-373f-4eeb-9f94-4d287627557f 1775995196247
+INFO:     90.90.97.27:34198 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back f71f9555-373f-4eeb-9f94-4d287627557f 1775995196522
+[+++] proxy get req c7823959-bc25-4d17-91d6-385427b2868b 1775995196523
+INFO:     90.90.97.27:34204 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back c7823959-bc25-4d17-91d6-385427b2868b 1775995196797
+[+++] proxy get req 599ff2c5-01bf-494c-b19a-f8703753629e 1775995196799
+INFO:     90.90.97.27:34216 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 599ff2c5-01bf-494c-b19a-f8703753629e 1775995197073
+[+++] proxy get req 6da9d97a-34b7-4aa8-8fac-f2c3add9ea44 1775995197075
+INFO:     90.90.97.27:34230 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 6da9d97a-34b7-4aa8-8fac-f2c3add9ea44 1775995197334
+[+++] proxy get req 30fbddeb-c1a6-420f-ac4e-73806d6922ca 1775995197336
+INFO:     90.90.97.27:34232 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 30fbddeb-c1a6-420f-ac4e-73806d6922ca 1775995197618
+[+++] proxy get req 20177261-0863-4d49-ba14-1ebccfb8223f 1775995197619
+INFO:     90.90.97.27:34244 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 20177261-0863-4d49-ba14-1ebccfb8223f 1775995197895
+[+++] proxy get req 1c9362e7-5199-4b9d-9709-ad34f02b2c23 1775995197897
+INFO:     90.90.97.27:34250 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 1c9362e7-5199-4b9d-9709-ad34f02b2c23 1775995198171
+[+++] proxy get req 29e9b1ee-ec04-49f4-b4fa-4314f409bd4e 1775995198172
+INFO:     90.90.97.27:34264 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 29e9b1ee-ec04-49f4-b4fa-4314f409bd4e 1775995198431
+[+++] proxy get req e5cf562b-242c-4e8b-a5b8-b357069cb1ce 1775995198433
+INFO:     90.90.97.27:34270 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back e5cf562b-242c-4e8b-a5b8-b357069cb1ce 1775995198723
+[+++] proxy get req 0f89f9f8-5baa-4f8b-b255-3ffb880bbd05 1775995198724
+INFO:     90.90.97.27:34276 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 0f89f9f8-5baa-4f8b-b255-3ffb880bbd05 1775995199029
+[+++] proxy get req e8c57535-41c4-4da3-ac1b-423caa945408 1775995199030
+INFO:     90.90.97.27:34288 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back e8c57535-41c4-4da3-ac1b-423caa945408 1775995199305
+[+++] proxy get req 3c8530f2-5729-4940-96d2-09cee4103b3d 1775995199307
+INFO:     90.90.97.27:34304 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 3c8530f2-5729-4940-96d2-09cee4103b3d 1775995199588
+[+++] proxy get req 874e9f88-2907-44cf-83ce-62756adc0198 1775995199590
+INFO:     90.90.97.27:34306 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 874e9f88-2907-44cf-83ce-62756adc0198 1775995199864
+[+++] proxy get req f86b85bb-a0e1-44d5-975b-97a724eb6a76 1775995199866
+INFO:     90.90.97.27:34318 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back f86b85bb-a0e1-44d5-975b-97a724eb6a76 1775995200140
+[+++] proxy get req 0e5e9282-aa0a-4957-9526-b05923fae1c7 1775995200141
+INFO:     90.90.97.27:34320 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 0e5e9282-aa0a-4957-9526-b05923fae1c7 1775995200401
+[+++] proxy get req 496eb0af-d440-4e6a-9c22-74f480b6a2cf 1775995200402
+INFO:     90.90.97.27:34324 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 496eb0af-d440-4e6a-9c22-74f480b6a2cf 1775995200676
+[+++] proxy get req 0dcaf2ce-526d-4cca-9049-9db3aa1f2cc7 1775995200678
+INFO:     90.90.97.27:34332 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 0dcaf2ce-526d-4cca-9049-9db3aa1f2cc7 1775995200953
+[+++] proxy get req fcd6e213-608d-4afa-a500-d7d932b68cb9 1775995200954
+INFO:     90.90.97.27:34340 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back fcd6e213-608d-4afa-a500-d7d932b68cb9 1775995201229
+[+++] proxy get req f79426b7-e2b1-4e44-9ca6-c15f3ca048f6 1775995201230
+INFO:     90.90.97.27:34354 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back f79426b7-e2b1-4e44-9ca6-c15f3ca048f6 1775995201505
+[+++] proxy get req 7b0e8bb6-e591-41c5-b235-f77a96f70902 1775995201506
+INFO:     90.90.97.27:34368 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 7b0e8bb6-e591-41c5-b235-f77a96f70902 1775995201781
+[+++] proxy get req b2f75552-d861-4461-aa5a-751902a1958c 1775995201783
+INFO:     90.90.97.27:34384 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back b2f75552-d861-4461-aa5a-751902a1958c 1775995202043
+[+++] proxy get req f8a4e6f2-4d2f-446e-b559-b70b1be2ab1d 1775995202044
+INFO:     90.90.97.27:34394 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back f8a4e6f2-4d2f-446e-b559-b70b1be2ab1d 1775995202303
+[+++] proxy get req 0904253f-eee6-42cb-9659-b57abaf9af76 1775995202305
+INFO:     90.90.97.27:34402 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 0904253f-eee6-42cb-9659-b57abaf9af76 1775995202564
+[+++] proxy get req 21f46093-ac49-4331-a743-c4ac93cd24c4 1775995202566
+INFO:     90.90.97.27:34410 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 21f46093-ac49-4331-a743-c4ac93cd24c4 1775995202840
+[+++] proxy get req 01459a69-cc9b-46d8-932b-e400875f7ac5 1775995202842
+INFO:     90.90.97.27:34418 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 01459a69-cc9b-46d8-932b-e400875f7ac5 1775995203116
+[+++] proxy get req 7da2a49a-cce8-49ba-a5d9-ddadef888522 1775995203118
+INFO:     90.90.97.27:34432 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 7da2a49a-cce8-49ba-a5d9-ddadef888522 1775995203377
+[+++] proxy get req 507b13b2-ed73-4eeb-b795-1783167c0972 1775995203379
+INFO:     90.90.97.27:34434 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 507b13b2-ed73-4eeb-b795-1783167c0972 1775995203639
+[+++] proxy get req 0dc3f3dd-b4e3-43e1-a624-7352d505bcae 1775995203640
+INFO:     90.90.97.27:34440 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 0dc3f3dd-b4e3-43e1-a624-7352d505bcae 1775995203914
+[+++] proxy get req 9fc4fcbe-ecb2-48ce-97ea-b8c10c12043f 1775995203916
+INFO:     90.90.97.27:34446 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 9fc4fcbe-ecb2-48ce-97ea-b8c10c12043f 1775995204175
+[+++] proxy get req 37acaf39-e44a-49c3-8192-2793339dfb30 1775995204176
+INFO:     90.90.97.27:34454 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 37acaf39-e44a-49c3-8192-2793339dfb30 1775995204421
+[+++] proxy get req 541aebc6-bc22-4b0e-b4a3-3d138dafa572 1775995204422
+INFO:     90.90.97.27:34464 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 541aebc6-bc22-4b0e-b4a3-3d138dafa572 1775995204697
+[+++] proxy get req 88df8e89-8d47-4ce8-9b84-da7e53ddcf08 1775995204698
+INFO:     90.90.97.27:34468 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[+++] proxy get first token back 88df8e89-8d47-4ce8-9b84-da7e53ddcf08 1775995204973

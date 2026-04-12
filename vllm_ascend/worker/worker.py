@@ -20,6 +20,7 @@
 import copy
 import gc
 from types import NoneType
+import time
 
 import torch
 import torch.nn as nn
@@ -389,8 +390,12 @@ class NPUWorker(WorkerBase):
             intermediate_tensors = IntermediateTensors(
                 get_pp_group().recv_tensor_dict(all_gather_group=all_gather_group)
             )
-
+        reqs = [req.req_id for req in scheduler_output.scheduled_new_reqs]
+        if len(reqs) > 0:
+            print(f"[+++] before worker exec {reqs} {(time.time_ns() // 1_000_000)}", flush=True)
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        if len(reqs) > 0:
+            print(f"[+++] after worker exec {reqs} {(time.time_ns() // 1_000_000)}", flush=True)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
