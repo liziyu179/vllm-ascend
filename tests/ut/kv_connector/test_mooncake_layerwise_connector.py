@@ -17,6 +17,7 @@ sys.modules["mooncake.engine"] = fake_engine
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (  # noqa: E402
     KVCacheRecvingLayerThread, KVCacheSendingLayerThread, KVConnectorRole,
+    LAYER_CHUNK_SIZE_ENV_VAR,
     MooncakeAgentMetadata, MooncakeLayerwiseConnector,
     MooncakeLayerwiseConnectorMetadata, MooncakeLayerwiseConnectorScheduler,
     MooncakeLayerwiseConnectorWorker, ReqMeta, SendReqInfo, SendTask,
@@ -954,3 +955,198 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         worker.register_kv_caches(mla_caches)
         self.assertTrue(worker.use_mla)
         self.assertEqual(len(worker.block_len), 2)
+
+
+class TestMooncakeLayerwiseConnectorWorkerChunkFlush(unittest.TestCase):
+
+    def _make_worker(self, *, layer_chunk_size=4, total_layers=8, current_layer=0):
+        worker = MooncakeLayerwiseConnectorWorker.__new__(MooncakeLayerwiseConnectorWorker)
+        worker.layer_chunk_size = layer_chunk_size
+        worker.total_layers = total_layers
+        worker.current_layer = current_layer
+        worker.pending_layer_send_tasks = []
+        worker.kv_send_layer_thread = SimpleNamespace(send_queue=MagicMock())
+        worker.vllm_config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(is_kv_producer=True)
+        )
+        worker.use_mla = False
+        worker.index_to_name = {i: [f"layer_{i}"] for i in range(total_layers)}
+        worker.layer_metadata = {
+            f"layer_{i}": SimpleNamespace(tensor_group_idx=[0]) for i in range(total_layers)
+        }
+        worker.kv_cache_specs = [MagicMock()]
+        worker.pd_head_ratio = 1
+        worker.enable_kv_quant = False
+        worker.k_buffer = None
+        worker.v_buffer = None
+        worker.k_quant_buffer = None
+        worker.v_quant_buffer = None
+        worker.resharding_stream = None
+        worker.update_decoder_info = MagicMock(side_effect=lambda req_id, req_meta: req_meta)
+        return worker
+
+    def test_start_load_kv_reads_layer_chunk_size_from_env(self):
+        worker = self._make_worker(layer_chunk_size=4)
+        worker.vllm_config.kv_transfer_config.is_kv_consumer = False
+        worker.vllm_config.kv_transfer_config.is_kv_producer = False
+
+        with patch.dict(os.environ, {LAYER_CHUNK_SIZE_ENV_VAR: "6"}, clear=False):
+            worker.start_load_kv(MooncakeLayerwiseConnectorMetadata())
+
+        self.assertEqual(worker.layer_chunk_size, 6)
+
+    def test_start_load_kv_ignores_invalid_layer_chunk_size_env(self):
+        worker = self._make_worker(layer_chunk_size=4)
+        worker.vllm_config.kv_transfer_config.is_kv_consumer = False
+        worker.vllm_config.kv_transfer_config.is_kv_producer = False
+
+        with patch.dict(os.environ, {LAYER_CHUNK_SIZE_ENV_VAR: "invalid"}, clear=False):
+            with patch(
+                "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.logger"
+            ) as mock_logger:
+                worker.start_load_kv(MooncakeLayerwiseConnectorMetadata())
+
+        self.assertEqual(worker.layer_chunk_size, 4)
+        mock_logger.warning.assert_called_once()
+
+    def test_wait_for_layer_load_flushes_previous_chunk(self):
+        worker = self._make_worker(layer_chunk_size=4, total_layers=8, current_layer=3)
+        worker.pending_layer_send_tasks = [
+            SendTask(layer_idx=0, layer_name="layer_0"),
+            SendTask(layer_idx=1, layer_name="layer_1"),
+            SendTask(layer_idx=2, layer_name="layer_2"),
+        ]
+
+        worker.wait_for_layer_load("layer_3")
+
+        worker.kv_send_layer_thread.send_queue.put.assert_called_once()
+        batch_task = worker.kv_send_layer_thread.send_queue.put.call_args.args[0]
+        self.assertEqual(batch_task.layer_idxs, [0, 1, 2])
+        self.assertEqual(batch_task.layer_idx, 2)
+        self.assertEqual(
+            [task.layer_idx for task in batch_task.batched_send_tasks],
+            [0, 1, 2],
+        )
+        self.assertEqual(worker.pending_layer_send_tasks, [])
+
+    def test_wait_for_layer_load_does_not_flush_non_boundary(self):
+        worker = self._make_worker(layer_chunk_size=4, total_layers=8, current_layer=2)
+        worker.pending_layer_send_tasks = [
+            SendTask(layer_idx=0, layer_name="layer_0"),
+            SendTask(layer_idx=1, layer_name="layer_1"),
+        ]
+
+        worker.wait_for_layer_load("layer_2")
+
+        worker.kv_send_layer_thread.send_queue.put.assert_not_called()
+        self.assertEqual(
+            [task.layer_idx for task in worker.pending_layer_send_tasks],
+            [0, 1],
+        )
+
+    def test_save_kv_layer_flushes_remaining_layers_on_last_layer(self):
+        worker = self._make_worker(layer_chunk_size=4, total_layers=5, current_layer=4)
+        worker.pending_layer_send_tasks = [
+            SendTask(layer_idx=1, layer_name="layer_1", send_request={"req-1": MagicMock()}),
+            SendTask(layer_idx=2, layer_name="layer_2", send_request={"req-1": MagicMock()}),
+            SendTask(layer_idx=3, layer_name="layer_3", send_request={"req-1": MagicMock()}),
+        ]
+
+        connector_metadata = MooncakeLayerwiseConnectorMetadata()
+        connector_metadata.requests["req-1"] = SimpleNamespace(local_block_ids=[[1]])
+        connector_metadata.send_task = SendTask(
+            group_rearrange_block_ids=[[]],
+            group_num_blocks=[0],
+            group_num_tokens=[0],
+            group_block_table=[None],
+            group_block_len_tensor=[None],
+            group_seq_start_tensor=[None],
+        )
+        attn_metadata = SimpleNamespace(reshape_cache_event=MagicMock())
+
+        worker.save_kv_layer("layer_4", [MagicMock(), MagicMock()], attn_metadata, connector_metadata)
+
+        worker.kv_send_layer_thread.send_queue.put.assert_called_once()
+        batch_task = worker.kv_send_layer_thread.send_queue.put.call_args.args[0]
+        self.assertEqual(batch_task.layer_idxs, [1, 2, 3, 4])
+        self.assertEqual(batch_task.layer_idx, 4)
+        self.assertEqual(
+            [task.layer_idx for task in batch_task.batched_send_tasks],
+            [1, 2, 3, 4],
+        )
+        self.assertEqual(worker.pending_layer_send_tasks, [])
+        self.assertEqual(worker.current_layer, 5)
+
+
+class TestKVCacheSendingLayerThreadBatchTask(unittest.TestCase):
+
+    def test_handle_request_aggregates_batch_into_single_transfer_per_session(self):
+        thread = KVCacheSendingLayerThread.__new__(KVCacheSendingLayerThread)
+        thread.pd_head_ratio = 1
+        thread.total_layers = 8
+        thread.layer_metadata = {
+            "layer_1": SimpleNamespace(tensor_group_idx=[0]),
+            "layer_2": SimpleNamespace(tensor_group_idx=[0]),
+        }
+        thread.engine = MagicMock()
+        thread.engine.batch_transfer_sync_write.return_value = 0
+        thread.callback_func = MagicMock()
+        thread.get_transfer_meta = MagicMock(
+            side_effect=[
+                ([10], [110], [4]),
+                ([20], [120], [4]),
+            ]
+        )
+
+        req_meta_1 = SimpleNamespace(remote_host="host", remote_te_rpc_port=9000, chunk_finish=False)
+        req_meta_2 = SimpleNamespace(remote_host="host", remote_te_rpc_port=9000, chunk_finish=False)
+        wait_event_1 = MagicMock()
+        wait_event_2 = MagicMock()
+        sub_task_1 = SendTask(
+            layer_idx=1,
+            layer_name="layer_1",
+            wait_event=wait_event_1,
+            send_request={"req-1": req_meta_1},
+        )
+        sub_task_2 = SendTask(
+            layer_idx=2,
+            layer_name="layer_2",
+            wait_event=wait_event_2,
+            send_request={"req-2": req_meta_2},
+        )
+        batch_task = SendTask(
+            batched_send_tasks=[sub_task_1, sub_task_2],
+            layer_idx=2,
+            layer_idxs=[1, 2],
+            wait_events=[wait_event_1, wait_event_2],
+        )
+
+        thread._handle_request(batch_task)
+
+        wait_event_1.synchronize.assert_called_once()
+        wait_event_2.synchronize.assert_called_once()
+        thread.engine.batch_transfer_sync_write.assert_called_once_with(
+            "host:9000",
+            [10, 20],
+            [110, 120],
+            [4, 4],
+        )
+
+    def test_handle_request_falls_back_to_per_layer_transfer_when_not_safe_to_aggregate(self):
+        thread = KVCacheSendingLayerThread.__new__(KVCacheSendingLayerThread)
+        thread.pd_head_ratio = 2
+        thread._transfer_kv_cache = MagicMock()
+
+        sub_task_1 = SendTask(layer_idx=1, layer_name="layer_1")
+        sub_task_2 = SendTask(layer_idx=2, layer_name="layer_2")
+        batch_task = SendTask(
+            batched_send_tasks=[sub_task_1, sub_task_2],
+            layer_idx=2,
+            layer_idxs=[1, 2],
+        )
+
+        thread._handle_request(batch_task)
+
+        self.assertEqual(thread._transfer_kv_cache.call_count, 2)
+        transferred_layers = [call.args[0].layer_idx for call in thread._transfer_kv_cache.call_args_list]
+        self.assertEqual(transferred_layers, [1, 2])

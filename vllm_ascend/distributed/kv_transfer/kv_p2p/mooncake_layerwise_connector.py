@@ -77,6 +77,7 @@ if TYPE_CHECKING:
 # isort: on
 
 DONE_SENDING_MSG = b"done_sending_msg"
+LAYER_CHUNK_SIZE_ENV_VAR = "VLLM_ASCEND_LAYER_CHUNK_SIZE"
 
 
 @dataclass
@@ -122,6 +123,7 @@ class SendTask:
     send_request: dict[str, ReqMeta] = field(default_factory=dict)
     # pd_head_ratio == 1 use
     wait_event: torch.npu.Event | None = None
+    wait_events: list[torch.npu.Event] | None = None
     # pd_head_ratio > 1 use
     k_cache: torch.Tensor | None = None
     v_cache: torch.Tensor | None = None
@@ -129,7 +131,9 @@ class SendTask:
     k_quant_cache: torch.Tensor | None = None
     v_quant_cache: torch.Tensor | None = None
     layer_idx: int = 0
+    layer_idxs: list[int] | None = None
     layer_name: str = ""
+    batched_send_tasks: list["SendTask"] | None = None
     # trans block info
     group_rearrange_block_ids: list[list[int]] | None = None
     group_num_blocks: list[int] | None = None
@@ -270,9 +274,88 @@ class KVCacheSendingLayerThread(threading.Thread):
 
     def _handle_request(self, send_task: SendTask):
         try:
-            self._transfer_kv_cache(send_task)
+            if send_task.batched_send_tasks:
+                self._transfer_batched_kv_cache(send_task)
+            else:
+                self._transfer_kv_cache(send_task)
         except Exception as e:
             logger.error(f"Failed to transfer KV cache for layer idx {send_task.layer_idx}, {e}")
+
+    def _can_aggregate_batched_send_task(self, send_task: SendTask) -> bool:
+        if not send_task.batched_send_tasks:
+            return False
+        if self.pd_head_ratio != 1:
+            return False
+        return all(layer_send_task.k_quant_cache is None for layer_send_task in send_task.batched_send_tasks)
+
+    def _run_transfer_for_session(
+        self,
+        session_id: str,
+        transfer_meta: TransferMeta,
+        callback_entries: list[tuple[str, ReqMeta, int]],
+        layer_desc: str,
+    ) -> None:
+        if len(transfer_meta.src) == 0:
+            return
+        req_start_time = time.perf_counter()
+        ret = self.engine.batch_transfer_sync_write(session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length)
+        if ret < 0:
+            logger.error(f"Mooncake transfer failed for send requests {transfer_meta.req_ids} kv cache to {session_id}")
+            for req_id, req_meta, layer_group_idx in callback_entries:
+                if req_meta.chunk_finish:
+                    self.callback_func(req_id, req_meta, layer_group_idx)
+            return
+
+        req_end_time = time.perf_counter()
+        total_transfer_size = sum(transfer_meta.length) / 1024
+        req_transfer_elapsed = (req_end_time - req_start_time) * 1000
+        logger.debug(
+            "Layer%s KV cache transfer task %dKB to remote_session_id [%s] took %.3f ms.",
+            layer_desc,
+            total_transfer_size,
+            session_id,
+            req_transfer_elapsed,
+        )
+        for req_id, req_meta, layer_group_idx in callback_entries:
+            if req_meta.chunk_finish:
+                self.callback_func(req_id, req_meta, layer_group_idx)
+
+    def _transfer_batched_kv_cache(self, send_task: SendTask) -> None:
+        if not self._can_aggregate_batched_send_task(send_task):
+            for layer_send_task in send_task.batched_send_tasks or []:
+                self._transfer_kv_cache(layer_send_task)
+            return
+
+        wait_events = send_task.wait_events or []
+        wait_events[0].synchronize()
+
+        session_meta: dict[str, TransferMeta] = {}
+        session_callbacks: dict[str, list[tuple[str, ReqMeta, int]]] = defaultdict(list)
+        for layer_send_task in send_task.batched_send_tasks or []:
+            layer_name = layer_send_task.layer_name
+            layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
+            for req_id, req_meta in layer_send_task.send_request.items():
+                session_id = f"{req_meta.remote_host}:{req_meta.remote_te_rpc_port}"
+                if session_id not in session_meta:
+                    session_meta[session_id] = TransferMeta(src=[], dst=[], length=[], req_ids=[])
+
+                src_list, dst_list, length_list = self.get_transfer_meta(layer_send_task, req_id, req_meta, layer_group_idx)
+                session_meta[session_id].src.extend(src_list)
+                session_meta[session_id].dst.extend(dst_list)
+                session_meta[session_id].length.extend(length_list)
+                session_meta[session_id].req_ids.append(req_id)
+
+                if layer_send_task.layer_idx == (self.total_layers - 1):
+                    session_callbacks[session_id].append((req_id, req_meta, layer_group_idx))
+
+        layer_desc = str(send_task.layer_idxs) if send_task.layer_idxs is not None else str(send_task.layer_idx)
+        for session_id, transfer_meta in session_meta.items():
+            self._run_transfer_for_session(
+                session_id,
+                transfer_meta,
+                session_callbacks.get(session_id, []),
+                layer_desc,
+            )
 
     def get_transfer_meta(self, send_task: SendTask, req_id: str, req_meta: ReqMeta, layer_group_idx: int):
         src_list: list[int] = []
@@ -472,38 +555,17 @@ class KVCacheSendingLayerThread(threading.Thread):
             self.resharding_stream.synchronize()
 
         for session_id, transfer_meta in session_meta.items():
-            if len(transfer_meta.src) > 0:
-                req_start_time = time.perf_counter()
-                ret = self.engine.batch_transfer_sync_write(
-                    session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
-                )
-                if ret < 0:
-                    logger.error(
-                        f"Mooncake transfer failed for send requests {transfer_meta.req_ids} kv cache to {session_id}"
-                    )
-                    if send_task.layer_idx == (self.total_layers - 1):
-                        for req_id in transfer_meta.req_ids:
-                            req_meta = send_task.send_request[req_id]
-                            if req_meta.chunk_finish:
-                                self.callback_func(
-                                    req_id, req_meta, layer_group_idx
-                                )  # TODO Send a signal indicating transmission failure
-                else:
-                    req_end_time = time.perf_counter()
-                    total_transfer_size = sum(transfer_meta.length) / 1024
-                    req_transfer_elapsed = (req_end_time - req_start_time) * 1000
-                    logger.debug(
-                        "Layer%d KV cache transfer task %dKB to remote_session_id [%s] took %.3f ms.",
-                        send_task.layer_idx,
-                        total_transfer_size,
-                        session_id,
-                        req_transfer_elapsed,
-                    )
-                    if send_task.layer_idx == (self.total_layers - 1):
-                        for req_id in transfer_meta.req_ids:
-                            req_meta = send_task.send_request[req_id]
-                            if req_meta.chunk_finish:
-                                self.callback_func(req_id, req_meta, layer_group_idx)
+            callback_entries = []
+            if send_task.layer_idx == (self.total_layers - 1):
+                callback_entries = [
+                    (req_id, send_task.send_request[req_id], layer_group_idx) for req_id in transfer_meta.req_ids
+                ]
+            self._run_transfer_for_session(
+                session_id,
+                transfer_meta,
+                callback_entries,
+                str(send_task.layer_idx),
+            )
 
 
 class KVCacheRecvingLayerThread(threading.Thread):
@@ -1033,10 +1095,12 @@ class MooncakeLayerwiseConnectorWorker:
         logger.info("Initializing Mooncake work %s", engine_id)
         self.engine = global_te.get_transfer_engine(self.side_channel_host, device_name=None)
         self.te_rpc_port = self.engine.get_rpc_port()
+        self.layer_chunk_size = max(1, vllm_config.kv_transfer_config.get_from_extra_config("layer_chunk_size", 1))
 
         # Background thread for sending or receiving KV caches.
         self.kv_recv_layer_thread: KVCacheRecvingLayerThread | None = None
         self.kv_send_layer_thread: KVCacheSendingLayerThread | None = None
+        self.pending_layer_send_tasks: list[SendTask] = []
 
         self.block_size: list[int] = [spec.block_size for spec in self.kv_cache_specs]
         self.kernel_block_size_scale: list[int] = [1 for _ in range(self.num_kv_cache_groups)]
@@ -1073,6 +1137,7 @@ class MooncakeLayerwiseConnectorWorker:
         self.k_quant_buffer: torch.Tensor | None = None
         self.v_quant_buffer: torch.Tensor | None = None
         self.virtual_request: set[str] = set()
+
 
     def create_kv_buffer(self, first_kv_cache_tuple):
         alignment = 2 * 1024 * 1024
@@ -1445,6 +1510,7 @@ class MooncakeLayerwiseConnectorWorker:
     def start_load_kv(self, metadata: MooncakeLayerwiseConnectorMetadata):
         """Start loading KV blocks from remote engine."""
         self.current_layer = 0
+        self.pending_layer_send_tasks.clear()
         if self.vllm_config.kv_transfer_config.is_kv_consumer:
             for req_id, meta in metadata.requests.items():
                 if meta.do_virtual:
@@ -1527,6 +1593,23 @@ class MooncakeLayerwiseConnectorWorker:
                         [send_task.group_num_tokens[i]], dtype=torch.int32, device=device
                     )
                     send_task.group_seq_start_tensor[i] = torch.tensor([0], dtype=torch.int32, device=device)
+
+    def _flush_pending_layer_send_tasks(self) -> None:
+        if not self.pending_layer_send_tasks:
+            return
+        assert self.kv_send_layer_thread is not None
+        batch_task = SendTask(
+            batched_send_tasks=list(self.pending_layer_send_tasks),
+            wait_events=[
+                send_task.wait_event for send_task in self.pending_layer_send_tasks if send_task.wait_event is not None
+            ],
+            layer_idxs=[send_task.layer_idx for send_task in self.pending_layer_send_tasks],
+            layer_idx=self.pending_layer_send_tasks[-1].layer_idx,
+            layer_name=self.pending_layer_send_tasks[-1].layer_name,
+            wait_event=self.pending_layer_send_tasks[-1].wait_event,
+        )
+        self.kv_send_layer_thread.send_queue.put(batch_task)
+        self.pending_layer_send_tasks.clear()
 
     def save_kv_layer(
         self,
@@ -1672,7 +1755,13 @@ class MooncakeLayerwiseConnectorWorker:
                 logger.debug(f"Add request {req_id} to kv send layer thread. {req_meta_update=}")
                 layer_send_task.send_request[req_id] = req_meta_update
 
-            self.kv_send_layer_thread.send_queue.put(layer_send_task)
+            if layer_send_task.send_request:
+                if self.layer_chunk_size > 1:
+                    self.pending_layer_send_tasks.append(layer_send_task)
+                else:
+                    self.kv_send_layer_thread.send_queue.put(layer_send_task)
+            if self.current_layer == self.total_layers - 1:
+                self._flush_pending_layer_send_tasks()
             self.current_layer += 1
 
     # NOTE: Due to the FIA operator constraints, the expected kv cache is ND format, NZ shape,
@@ -1801,7 +1890,14 @@ class MooncakeLayerwiseConnectorWorker:
             )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        pass
+        if not self.vllm_config.kv_transfer_config.is_kv_producer:
+            return
+        if self.layer_chunk_size <= 1:
+            return
+        if not self.pending_layer_send_tasks:
+            return
+        if self.current_layer % self.layer_chunk_size == self.layer_chunk_size - 1:
+            self._flush_pending_layer_send_tasks()
 
 
 @contextlib.contextmanager
