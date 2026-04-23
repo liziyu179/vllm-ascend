@@ -569,11 +569,7 @@ func (p *LayerwiseProxy) forwardLayerwiseStream(
 				if retry {
 					return true, completionTokens, nil
 				}
-				line = out
-				if len(line) > 0 && !bytes.HasSuffix(line, []byte("\n")) {
-					line = append([]byte("data: "), line...)
-					line = append(line, '\n', '\n')
-				}
+				line = formatSSEDataLine(out)
 			}
 			if _, err := bw.Write(line); err != nil {
 				return false, completionTokens, err
@@ -611,6 +607,10 @@ func (p *LayerwiseProxy) forwardLayerwiseJSON(
 	}
 	_, err = w.Write(out)
 	return false, completionTokens, err
+}
+
+func formatSSEDataLine(payload []byte) []byte {
+	return append(append([]byte("data: "), payload...), '\n')
 }
 
 func processLayerwisePayload(payload []byte, generated *string, rewriteFinal bool) (bool, int, []byte, error) {

@@ -16,10 +16,10 @@ import (
 )
 
 type pendingRequest struct {
-	APIPath      string
-	RequestLen   int
-	RequestData  map[string]any
-	OriginReqID  string
+	APIPath     string
+	RequestLen  int
+	RequestData map[string]any
+	OriginReqID string
 }
 
 func NewLayerwise(cfg Config) (*Proxy, error) {
@@ -317,7 +317,7 @@ func (p *Proxy) forwardLayerwiseStream(
 				if retry {
 					return true, completionTokens, nil
 				}
-				line = out
+				line = formatSSEDataLine(out)
 			}
 			if _, err := bw.Write(line); err != nil {
 				return false, completionTokens, err
@@ -355,6 +355,10 @@ func (p *Proxy) forwardLayerwiseJSON(
 	}
 	_, err = w.Write(out)
 	return false, completionTokens, err
+}
+
+func formatSSEDataLine(payload []byte) []byte {
+	return append(append([]byte("data: "), payload...), '\n')
 }
 
 func processLayerwisePayload(payload []byte, generated *string, rewriteFinal bool) (bool, int, []byte, error) {
