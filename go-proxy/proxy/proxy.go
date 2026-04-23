@@ -633,4 +633,3 @@ func (h *selHeap) Pop() any {
 	*h = old[:n-1]
 	return it
 }
-

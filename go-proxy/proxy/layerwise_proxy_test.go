@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,42 +15,7 @@ import (
 	"time"
 )
 
-type backendCounters struct {
-	prefillCalls atomic.Int64
-	decodeCalls  atomic.Int64
-}
-
-type inmemTransport struct {
-	mu       sync.RWMutex
-	handlers map[string]http.Handler // key: host:port
-}
-
-func newInmemTransport() *inmemTransport {
-	return &inmemTransport{handlers: map[string]http.Handler{}}
-}
-
-func (t *inmemTransport) Register(hostport string, h http.Handler) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.handlers[hostport] = h
-}
-
-func (t *inmemTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	t.mu.RLock()
-	h := t.handlers[req.URL.Host]
-	t.mu.RUnlock()
-	if h == nil {
-		return nil, fmt.Errorf("no inmem handler for %s", req.URL.Host)
-	}
-	rr := httptest.NewRecorder()
-	r2 := req.Clone(req.Context())
-	r2.URL = &url.URL{}
-	*r2.URL = *req.URL
-	h.ServeHTTP(rr, r2)
-	return rr.Result(), nil
-}
-
-func newMockPrefillerHandler(t *testing.T, c *backendCounters) http.Handler {
+func newLayerwisePrefillerHandler(t *testing.T, c *backendCounters) http.Handler {
 	t.Helper()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -73,25 +37,20 @@ func newMockPrefillerHandler(t *testing.T, c *backendCounters) http.Handler {
 			http.Error(w, "prefill must be non-stream", http.StatusBadRequest)
 			return
 		}
-		if mt, ok := m["max_tokens"].(float64); !ok || int(mt) != 1 {
+		if mt := intValue(m["max_tokens"], -1); mt != 1 {
 			http.Error(w, "max_tokens must be 1", http.StatusBadRequest)
-			return
-		}
-		if kv, ok := m["kv_transfer_params"].(map[string]any); !ok || kv["do_remote_decode"] != true {
-			http.Error(w, "missing kv_transfer_params", http.StatusBadRequest)
 			return
 		}
 
 		writeJSON(w, http.StatusOK, map[string]any{
 			"kv_transfer_params": map[string]any{
-				"remote_host": "decoder",
-				"remote_port": 0,
+				"prefill_done": true,
 			},
 		})
 	})
 }
 
-func newMockDecoderHandler(t *testing.T, c *backendCounters) http.Handler {
+func newLayerwiseDecoderHandler(t *testing.T, c *backendCounters, client *http.Client) http.Handler {
 	t.Helper()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -105,20 +64,51 @@ func newMockDecoderHandler(t *testing.T, c *backendCounters) http.Handler {
 		c.decodeCalls.Add(1)
 
 		var m map[string]any
-		b, _ := io.ReadAll(r.Body)
-		_ = json.Unmarshal(b, &m)
+		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+
+		kv, _ := m["kv_transfer_params"].(map[string]any)
+		metaserver, _ := kv["metaserver"].(string)
+		if metaserver == "" {
+			http.Error(w, "missing metaserver", http.StatusBadRequest)
+			return
+		}
+
+		apiPath := strings.TrimPrefix(r.URL.Path, "/v1")
+		requestID := apiRequestID(apiPath, r.Header.Get("X-Request-Id"))
+		payload := map[string]any{
+			"request_id": requestID,
+			"connector":  "mock-layerwise",
+		}
+		b, _ := json.Marshal(payload)
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, metaserver, bytes.NewReader(b))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			http.Error(w, fmt.Sprintf("metaserver status %d", resp.StatusCode), http.StatusBadGateway)
+			return
+		}
 
 		streamFlag, _ := m["stream"].(bool)
 		if streamFlag {
 			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
 			fl, _ := w.(http.Flusher)
-			for i := 0; i < 3; i++ {
-				msg := fmt.Sprintf("data: %s\n\n", `{"choices":[{"text":"x"}]}`)
-				_, _ = w.Write([]byte(msg))
-				if fl != nil {
-					fl.Flush()
-				}
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n"))
+			if fl != nil {
+				fl.Flush()
 			}
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
 			if fl != nil {
@@ -128,44 +118,39 @@ func newMockDecoderHandler(t *testing.T, c *backendCounters) http.Handler {
 		}
 
 		writeJSON(w, http.StatusOK, map[string]any{
-			"id":      r.Header.Get("X-Request-Id"),
+			"id":      requestID,
 			"choices": []any{map[string]any{"text": "ok"}},
+			"usage":   map[string]any{"completion_tokens": 1},
 		})
 	})
 }
 
-func newMockPrefiller(t *testing.T, c *backendCounters) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(newMockPrefillerHandler(t, c))
-}
-
-func newMockDecoder(t *testing.T, c *backendCounters) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(newMockDecoderHandler(t, c))
-}
-
-func TestProxy_10000Concurrent(t *testing.T) {
+func TestLayerwiseProxy_10000Concurrent(t *testing.T) {
 	t.Parallel()
 
 	var b0, b1 backendCounters
 
 	tr := newInmemTransport()
-	tr.Register("prefill0:1", newMockPrefillerHandler(t, &b0))
-	tr.Register("prefill1:1", newMockPrefillerHandler(t, &b1))
-	tr.Register("decode0:1", newMockDecoderHandler(t, &b0))
-	tr.Register("decode1:1", newMockDecoderHandler(t, &b1))
+	client := &http.Client{Transport: tr}
 
-	p, err := New(Config{
-		Prefillers: []string{"prefill0:1", "prefill1:1"},
-		Decoders:   []string{"decode0:1", "decode1:1"},
-		MaxRetries: 3,
-		RetryDelay: 1 * time.Millisecond,
-		Client:     &http.Client{Transport: tr},
+	tr.Register("prefill0:1", newLayerwisePrefillerHandler(t, &b0))
+	tr.Register("prefill1:1", newLayerwisePrefillerHandler(t, &b1))
+	tr.Register("decode0:1", newLayerwiseDecoderHandler(t, &b0, client))
+	tr.Register("decode1:1", newLayerwiseDecoderHandler(t, &b1, client))
+
+	p, err := NewLayerwiseProxy(LayerwiseConfig{
+		Prefillers:    []string{"prefill0:1", "prefill1:1"},
+		Decoders:      []string{"decode0:1", "decode1:1"},
+		PublicBaseURL: "http://proxy.local",
+		MaxRetries:    3,
+		RetryDelay:    1 * time.Millisecond,
+		Client:        client,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	h := p.Handler()
+	tr.Register("proxy.local", h)
 
 	const N = 10000
 	var okCount atomic.Int64
@@ -193,18 +178,18 @@ func TestProxy_10000Concurrent(t *testing.T) {
 			rr := httptest.NewRecorder()
 			h.ServeHTTP(rr, req)
 			if rr.Code != http.StatusOK {
-				body := rr.Body.String()
 				if rr.Code >= 400 && rr.Code < 500 {
 					status4xx.Add(1)
 				} else if rr.Code >= 500 {
 					status5xx.Add(1)
 				}
 				select {
-				case firstErr <- fmt.Sprintf("status %d body=%q", rr.Code, body):
+				case firstErr <- fmt.Sprintf("status %d body=%q", rr.Code, rr.Body.String()):
 				default:
 				}
 				return
 			}
+
 			var out map[string]any
 			if err := json.NewDecoder(rr.Body).Decode(&out); err != nil {
 				select {
@@ -249,26 +234,29 @@ func TestProxy_10000Concurrent(t *testing.T) {
 	}
 }
 
-func TestProxy_Stream(t *testing.T) {
+func TestLayerwiseProxy_Stream(t *testing.T) {
 	t.Parallel()
-	var b backendCounters
-	p0 := newMockPrefiller(t, &b)
-	defer p0.Close()
-	d0 := newMockDecoder(t, &b)
-	defer d0.Close()
 
-	p, err := New(Config{
-		Prefillers: []string{trimHTTP(p0.URL)},
-		Decoders:   []string{trimHTTP(d0.URL)},
-		MaxRetries: 1,
-		RetryDelay: 1 * time.Millisecond,
-		Client:     defaultHTTPClient(),
+	var b backendCounters
+
+	tr := newInmemTransport()
+	client := &http.Client{Transport: tr}
+	tr.Register("prefill0:1", newLayerwisePrefillerHandler(t, &b))
+	tr.Register("decode0:1", newLayerwiseDecoderHandler(t, &b, client))
+
+	p, err := NewLayerwiseProxy(LayerwiseConfig{
+		Prefillers:    []string{"prefill0:1"},
+		Decoders:      []string{"decode0:1"},
+		PublicBaseURL: "http://proxy.local",
+		MaxRetries:    1,
+		RetryDelay:    1 * time.Millisecond,
+		Client:        client,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxySrv := httptest.NewServer(p.Handler())
-	defer proxySrv.Close()
+	h := p.Handler()
+	tr.Register("proxy.local", h)
 
 	reqBody := map[string]any{
 		"model":      "m",
@@ -277,20 +265,18 @@ func TestProxy_Stream(t *testing.T) {
 		"stream":     true,
 	}
 	bb, _ := json.Marshal(reqBody)
-	resp, err := http.Post(proxySrv.URL+"/v1/completions", "application/json", bytes.NewReader(bb))
-	if err != nil {
-		t.Fatal(err)
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/v1/completions", bytes.NewReader(bb))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
 	}
-	defer resp.Body.Close()
-	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+	if ct := rr.Header().Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
 		t.Fatalf("content-type %q", ct)
 	}
-	out, _ := io.ReadAll(resp.Body)
-	if !bytes.Contains(out, []byte("[DONE]")) {
-		t.Fatalf("missing DONE: %q", string(out))
+	if body := rr.Body.String(); !strings.Contains(body, "[DONE]") {
+		t.Fatalf("missing DONE: %q", body)
 	}
-}
-
-func trimHTTP(url string) string {
-	return strings.TrimPrefix(url, "http://")
 }

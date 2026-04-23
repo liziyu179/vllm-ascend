@@ -19,6 +19,12 @@ cd go-proxy
 go run ./cmd/proxy -listen 127.0.0.1:9000 -prefillers 127.0.0.1:8100,127.0.0.1:8101 -decoders 127.0.0.1:8200,127.0.0.1:8201
 ```
 
+### Layerwise Run
+```bash
+cd go-proxy
+go run ./cmd/layerwise-proxy -listen 127.0.0.1:9001 -public-base-url http://127.0.0.1:9001 -prefillers 127.0.0.1:8100,127.0.0.1:8101 -decoders 127.0.0.1:8200,127.0.0.1:8201
+```
+
 ### Tests (includes ~10k concurrency)
 ```bash
 cd go-proxy
