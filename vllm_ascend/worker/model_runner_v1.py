@@ -1356,9 +1356,45 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            for layer_idx, kv_cache in enumerate(self.kv_caches):
+                if isinstance(kv_cache, (tuple, list)) and len(kv_cache) >= 2:
+                    block_table = self.input_batch.block_table[0]
+                    for req_idx, req_id in enumerate(req_ids):
+                        kv_len = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+                        if kv_len == 0:
+                            continue
+                        block_ids = block_table.block_table.gpu[req_idx, :cdiv(kv_len, block_table.block_size)]
+                        offsets = torch.arange(kv_len, device=self.device) % block_table.block_size
+                        slots = (block_ids.repeat_interleave(block_table.block_size)[:kv_len].to(torch.long)
+                                * block_table.block_size + offsets)
+                        k_cache = kv_cache[0].reshape(-1, *kv_cache[0].shape[2:]).index_select(0, slots).float()
+                        v_cache = kv_cache[1].reshape(-1, *kv_cache[1].shape[2:]).index_select(0, slots).float()
+                        logger.info("KV cache stats: req_id=%s layer_idx=%d kv_len=%d k_mean=%s k_var=%s "
+                                    "v_mean=%s v_var=%s", req_id, layer_idx, kv_len, k_cache.mean().item(),
+                                    k_cache.var(unbiased=False).item(), v_cache.mean().item(),
+                                    v_cache.var(unbiased=False).item())
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+        if self.is_kv_producer:
+            torch.npu.synchronize()
+            block_table = self.input_batch.block_table[0]
+            for layer_idx, kv_cache in enumerate(self.kv_caches):
+                if isinstance(kv_cache, (tuple, list)) and len(kv_cache) >= 2:
+                    for req_idx, req_id in enumerate(req_ids):
+                        kv_len = int(self.input_batch.num_computed_tokens_cpu[req_idx]) + tokens[req_idx]
+                        if kv_len == 0:
+                            continue
+                        block_ids = block_table.block_table.gpu[req_idx, :cdiv(kv_len, block_table.block_size)]
+                        offsets = torch.arange(kv_len, device=self.device) % block_table.block_size
+                        slots = (block_ids.repeat_interleave(block_table.block_size)[:kv_len].to(torch.long)
+                                * block_table.block_size + offsets)
+                        k_cache = kv_cache[0].reshape(-1, *kv_cache[0].shape[2:]).index_select(0, slots[:-1]).float()
+                        v_cache = kv_cache[1].reshape(-1, *kv_cache[1].shape[2:]).index_select(0, slots[:-1]).float()
+                        logger.info("P node generated KV cache stats: req_id=%s layer_idx=%d kv_len=%d "
+                                    "k_mean=%s k_var=%s v_mean=%s v_var=%s", req_id, layer_idx, kv_len,
+                                    k_cache.mean().item(), k_cache.var(unbiased=False).item(),
+                                    v_cache.mean().item(), v_cache.var(unbiased=False).item())
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
