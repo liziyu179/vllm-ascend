@@ -729,6 +729,7 @@ async def _handle_completions(api: str, request: Request):
 
         async def generate_stream():
             nonlocal instance_info
+            nonlocal api
             generated_token = ""
             released_kv = False
             retry_count = 0
@@ -788,7 +789,12 @@ async def _handle_completions(api: str, request: Request):
                             retry = True
                             retry_count += 1
                             if chat_flag:
-                                messages[0]["content"] = origin_prompt + generated_token
+                                token_ids = choice.get("token_ids")
+                                if not token_ids:
+                                    raise RuntimeError("Recomputed chat response did not include token_ids.")
+                                req_data.pop("messages", None)
+                                req_data["prompt_token_ids"] = token_ids
+                                api = "/chat/completions/token_ids"
                             else:
                                 req_data["prompt"] = origin_prompt + generated_token
                             req_data["max_tokens"] = origin_max_tokens - completion_tokens + retry_count
