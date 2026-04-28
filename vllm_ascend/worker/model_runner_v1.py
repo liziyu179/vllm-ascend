@@ -1392,7 +1392,7 @@ class NPUModelRunner(GPUModelRunner):
                         k_cache = kv_cache[0].reshape(-1, *kv_cache[0].shape[2:]).index_select(0, slots[:-1]).float()
                         v_cache = kv_cache[1].reshape(-1, *kv_cache[1].shape[2:]).index_select(0, slots[:-1]).float()
                         logger.info("P node generated KV cache stats: req_id=%s layer_idx=%d kv_len=%d "
-                                    "k_mean=%s k_var=%s v_mean=%s v_var=%s", req_id, layer_idx, kv_len,
+                                    "k_mean=%s k_var=%s v_mean=%s v_var=%s", req_id, layer_idx, kv_len-1,
                                     k_cache.mean().item(), k_cache.var(unbiased=False).item(),
                                     v_cache.mean().item(), v_cache.var(unbiased=False).item())
         with record_function_or_nullcontext("post process"):
