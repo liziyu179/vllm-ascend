@@ -156,6 +156,8 @@ class InstanceType:
 
 
 TAINT_PRIORITY = 1e15
+CHAT_COMPLETIONS_API = "/chat/completions"
+CHAT_COMPLETIONS_TOKEN_IDS_API = "/chat/completions/token_ids"
 
 
 class ServerState:
@@ -726,9 +728,11 @@ async def _handle_completions(api: str, request: Request):
             origin_prompt = ""
         # refer to vLLM sampling_params: max_token default value
         origin_max_tokens = req_data.get("max_tokens", 16)
+        origin_max_completion_tokens = req_data.get("max_completion_tokens")
 
         async def generate_stream():
             nonlocal instance_info
+            nonlocal api
             generated_token = ""
             released_kv = False
             retry_count = 0
@@ -746,62 +750,87 @@ async def _handle_completions(api: str, request: Request):
                         max_retries=global_args.max_retries,
                         base_delay=global_args.retry_delay,
                     ):
-                        if not released_kv and chunk:
-                            proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
-                            released_kv = True
-                        try:
-                            chunk_str = chunk.decode("utf-8").strip()
-                        except UnicodeDecodeError:
-                            logger.debug(f"Skipping chunk: {chunk}")
-                            yield chunk
-                            continue
-                        if not chunk_str:
-                            continue
-                        if chunk_str.startswith("data: "):
-                            chunk_str = chunk_str[len("data: ") :]
-                        try:
-                            chunk_json = json.loads(chunk_str)
-                        except json.JSONDecodeError:
-                            # if chunk is [done], skip it.
-                            logger.debug(f"Skipping chunk: {chunk_str}")
-                            yield chunk
-                            continue
-                        choices = chunk_json.get("choices", [])
-                        if not choices:
-                            yield chunk
-                            continue
+                        for chunk in _split_sse_chunk(chunk) if stream_flag else [chunk]:
+                            if not released_kv and chunk:
+                                proxy_state.release_prefiller_kv(
+                                    instance_info.prefiller_idx, instance_info.prefiller_score
+                                )
+                                released_kv = True
+                            try:
+                                chunk_str = chunk.decode("utf-8").strip()
+                            except UnicodeDecodeError:
+                                logger.debug(f"Skipping chunk: {chunk}")
+                                yield chunk
+                                continue
+                            if not chunk_str:
+                                continue
+                            if chunk_str.startswith("data: "):
+                                chunk_str = chunk_str[len("data: ") :]
+                            try:
+                                chunk_json = json.loads(chunk_str)
+                            except json.JSONDecodeError:
+                                # if chunk is [done], skip it.
+                                logger.debug(f"Skipping chunk: {chunk_str}")
+                                yield chunk
+                                continue
+                            choices = chunk_json.get("choices", [])
+                            if not choices:
+                                yield chunk
+                                continue
 
-                        choice = choices[0]
-                        delta = choice.get("delta") or {}
-                        message = choice.get("message") or {}
-                        content = delta.get("content") or message.get("content") or choice.get("text") or ""
-                        generated_token += content
+                            choice = choices[0]
+                            delta = choice.get("delta") or {}
+                            message = choice.get("message") or {}
+                            content = delta.get("content") or message.get("content") or choice.get("text") or ""
+                            generated_token += content
 
-                        stop_reason = choice.get("stop_reason")
-                        usage = chunk_json.get("usage", {})
-                        completion_tokens = (
-                            (completion_tokens + 1)
-                            if stream_flag
-                            else (completion_tokens + usage.get("completion_tokens"))
-                        )
-                        if stop_reason == "recomputed":
-                            retry = True
-                            retry_count += 1
-                            if chat_flag:
-                                messages[0]["content"] = origin_prompt + generated_token
-                            else:
-                                req_data["prompt"] = origin_prompt + generated_token
-                            req_data["max_tokens"] = origin_max_tokens - completion_tokens + retry_count
-                            tmp_request_length = len(json.dumps(req_data).encode("utf-8"))
-                            instance_info = await _handle_select_instance(api, req_data, tmp_request_length)
+                            stop_reason = choice.get("stop_reason")
+                            usage = chunk_json.get("usage", {})
+                            completion_tokens = (
+                                (completion_tokens + 1)
+                                if stream_flag
+                                else (completion_tokens + usage.get("completion_tokens"))
+                            )
+                            if stop_reason == "recomputed":
+                                retry = True
+                                retry_count += 1
+                                proxy_state.release_decoder(
+                                    instance_info.decoder_idx, instance_info.decoder_score
+                                )
+                                if chat_flag:
+                                    token_ids = choice.get("token_ids")
+                                    if not token_ids:
+                                        raise RuntimeError(
+                                            "Recomputed chat response did not include token_ids. "
+                                            "Please make sure the decoder supports "
+                                            f"{CHAT_COMPLETIONS_TOKEN_IDS_API}."
+                                        )
+                                    req_data.pop("messages", None)
+                                    req_data["prompt_token_ids"] = token_ids
+                                    api = CHAT_COMPLETIONS_TOKEN_IDS_API
+                                else:
+                                    req_data["prompt"] = origin_prompt + generated_token
+                                remaining_tokens = origin_max_tokens - completion_tokens + retry_count
+                                req_data["max_tokens"] = remaining_tokens
+                                if origin_max_completion_tokens is not None:
+                                    req_data["max_completion_tokens"] = (
+                                        origin_max_completion_tokens
+                                        - completion_tokens
+                                        + retry_count
+                                    )
+                                tmp_request_length = len(json.dumps(req_data).encode("utf-8"))
+                                instance_info = await _handle_select_instance(api, req_data, tmp_request_length)
+                                released_kv = False
+                                break
+                            if retry_count > 0 and not stream_flag:
+                                if chat_flag:
+                                    choice["message"]["content"] = generated_token
+                                else:
+                                    choice["text"] = generated_token
+                                chunk = json.dumps(chunk_json).encode("utf-8")
+                            yield chunk
+                        if retry:
                             break
-                        if retry_count > 0 and not stream_flag:
-                            if chat_flag:
-                                choice["message"]["content"] = generated_token
-                            else:
-                                choice["text"] = generated_token
-                            chunk = json.dumps(chunk_json).encode("utf-8")
-                        yield chunk
             except Exception as e:
                 logger.error(
                     f"Error during streaming from decoder {instance_info.decoder.url}: {str(e)} "
@@ -887,7 +916,7 @@ async def handle_completions(request: Request):
 @app.post("/v1/chat/completions")
 @with_cancellation
 async def handle_chat_completions(request: Request):
-    return await _handle_completions("/chat/completions", request)
+    return await _handle_completions(CHAT_COMPLETIONS_API, request)
 
 
 @app.get("/healthcheck")

@@ -835,7 +835,7 @@ class RecomputeScheduler(Scheduler):
                     EngineCoreOutput(
                         request_id=req_info.request_id,
                         finish_reason=FinishReason.STOP,
-                        new_token_ids=[],
+                        new_token_ids=list(req_info.output_token_ids),
                         stop_reason="recomputed",
                     )
                 )
