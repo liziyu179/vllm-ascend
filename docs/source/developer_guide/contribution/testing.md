@@ -23,7 +23,7 @@ cd ~/vllm-project/
 # vllm  vllm-ascend
 
 # Use mirror to speed up download
-# docker pull quay.nju.edu.cn/ascend/cann:|cann_image_tag|
+# docker pull m.daocloud.io/quay.io/ascend/cann:|cann_image_tag|
 export IMAGE=quay.io/ascend/cann:|cann_image_tag|
 docker run --rm --name vllm-ascend-ut \
     -v $(pwd):/vllm-project \
@@ -40,6 +40,7 @@ export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu/ https://mirror
 # src path
 export SRC_WORKSPACE=/vllm-workspace
 mkdir -p $SRC_WORKSPACE
+cd $SRC_WORKSPACE
 
 apt-get update -y
 apt-get install -y python3-pip git vim wget net-tools gcc g++ cmake libnuma-dev curl gnupg2

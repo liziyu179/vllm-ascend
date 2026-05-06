@@ -323,12 +323,12 @@ Run docker container to start the vLLM server on single-NPU:
    :substitutions:
 vllm serve Qwen/Qwen3-VL-8B-Instruct \
 --dtype bfloat16 \
---max_model_len 16384 \
+--max-model-len 16384 \
 --max-num-batched-tokens 16384
 ```
 
 :::{note}
-Add `--max_model_len` option to avoid ValueError that the Qwen3-VL-8B-Instruct model's max seq len (256000) is larger than the maximum number of tokens that can be stored in KV cache. This will differ with different NPU series based on the on-chip memory size. Please modify the value according to a suitable value for your NPU series.
+Add `--max-model-len` option to avoid ValueError that the Qwen3-VL-8B-Instruct model's max seq len (256000) is larger than the maximum number of tokens that can be stored in KV cache. This will differ with different NPU series based on the on-chip memory size. Please modify the value according to a suitable value for your NPU series.
 :::
 
 If your service start successfully, you can see the info shown below:
@@ -350,7 +350,7 @@ curl http://localhost:8000/v1/chat/completions \
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": "https://modelscope.oss-cn-beijing.aliyuncs.com/resource/qwen.png"}},
-        {"type": "text", "text": "What is the text in the illustrate?"}
+        {"type": "text", "text": "What is the text in the illustration?"}
     ]}
     ]
     }'
@@ -415,7 +415,7 @@ vllm serve Qwen/Qwen2.5-VL-32B-Instruct \
 ```
 
 :::{note}
-Add `--max_model_len` option to avoid ValueError that the Qwen2.5-VL-32B-Instruct model's max_model_len (128000) is larger than the maximum number of tokens that can be stored in KV cache. This will differ with different NPU series base on the on-chip memory size. Please modify the value according to a suitable value for your NPU series.
+Add `--max-model-len` option to avoid ValueError that the Qwen2.5-VL-32B-Instruct model's max_model_len (128000) is larger than the maximum number of tokens that can be stored in KV cache. This will differ with different NPU series base on the on-chip memory size. Please modify the value according to a suitable value for your NPU series.
 :::
 
 If your service start successfully, you can see the info shown below:
@@ -437,7 +437,7 @@ curl http://localhost:8000/v1/chat/completions \
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": "https://modelscope.oss-cn-beijing.aliyuncs.com/resource/qwen.png"}},
-        {"type": "text", "text": "What is the text in the illustrate?"}
+        {"type": "text", "text": "What is the text in the illustration?"}
     ]}
     ]
     }'

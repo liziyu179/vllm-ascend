@@ -74,7 +74,7 @@ The environment variable `LOCAL_MEDIA_PATH` which allows API requests to read lo
 :::
 
 ```bash
-export VLLM_USE_MODELSCOPE=true
+export VLLM_USE_MODELSCOPE=True
 export MODEL_PATH="Qwen/Qwen2.5-Omni-7B"
 export LOCAL_MEDIA_PATH=$HOME/.cache/vllm/assets/vllm_public_assets/
 
@@ -104,7 +104,7 @@ VLLM_TARGET_DEVICE=empty pip install -v ".[audio]"
 #### Multiple NPU (Qwen2.5-Omni-7B)
 
 ```bash
-export VLLM_USE_MODELSCOPE=true
+export VLLM_USE_MODELSCOPE=True
 export MODEL_PATH=Qwen/Qwen2.5-Omni-7B
 export LOCAL_MEDIA_PATH=$HOME/.cache/vllm/assets/vllm_public_assets/
 export DP_SIZE=8
@@ -178,7 +178,7 @@ Qwen2.5-Omni on vllm-ascend has been tested on AISBench.
 
 1. Refer to [Using AISBench](../../developer_guide/evaluation/using_ais_bench.md) for details.
 
-2. After execution, you can get the result, here is the result of `Qwen2.5-Omni-7B` with `vllm-ascend:0.11.0rc0` for reference only.
+2. After execution, you can get the result, here is the result of `Qwen2.5-Omni-7B` with `vllm-ascend:v0.11.0rc0` for reference only.
 
 | dataset | platform | metric | mode | vllm-api-stream-chat |
 |----- | ----- | ----- | ----- | -----|

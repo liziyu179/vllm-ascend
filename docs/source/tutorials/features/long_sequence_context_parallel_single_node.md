@@ -72,7 +72,7 @@ Run the following script to execute online 128k inference.
 ```shell
 #!/bin/sh
 # Load model from ModelScope to speed up download
-export VLLM_USE_MODELSCOPE=true
+export VLLM_USE_MODELSCOPE=True
 # To reduce memory fragmentation and avoid out of memory
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HCCL_BUFFSIZE=512
@@ -93,8 +93,8 @@ vllm serve vllm-ascend/Qwen3-235B-A22B-w8a8 \
   --quantization ascend \
   --served-model-name qwen3 \
   --max-num-seqs 1 \
-  --max-model-len 133008 \
-  --max-num-batched-tokens 133008 \
+  --max-model-len 131072 \
+  --max-num-batched-tokens 131072 \
   --enable-expert-parallel \
   --trust-remote-code \
   --gpu-memory-utilization 0.95 \
@@ -105,8 +105,8 @@ vllm serve vllm-ascend/Qwen3-235B-A22B-w8a8 \
 
 **Notice:**
 
-- for vllm version below `v0.12.0` use parameter: `--rope_scaling '{"rope_type":"yarn","factor":4,"original_max_position_embeddings":32768}' \`
-- for vllm version `v0.12.0` use parameter: `--hf-overrides '{"rope_parameters": {"rope_type":"yarn","rope_theta":1000000,"factor":4,"original_max_position_embeddings":32768}}' \`
+- for vllm version below `v0.12.0` use parameter: `--rope-scaling '{"rope_type":"yarn","factor":4,"original_max_position_embeddings":32768}' \`
+- for vllm version same as or newer than `v0.12.0` use parameter: `--hf-overrides '{"rope_parameters": {"rope_type":"yarn","rope_theta":1000000,"factor":4,"original_max_position_embeddings":32768}}' \`
 
 The parameters are explained as follows:
 
@@ -166,7 +166,7 @@ There are three `vllm bench` subcommands:
 Take the `serve` as an example. Run the code as follows.
 
 ```shell
-export VLLM_USE_MODELSCOPE=true
+export VLLM_USE_MODELSCOPE=True
 vllm bench serve --model vllm-ascend/Qwen3-235B-A22B-w8a8  --dataset-name random --random-input 131072 --num-prompts 1 --request-rate 1 --save-result --result-dir ./
 ```
 
