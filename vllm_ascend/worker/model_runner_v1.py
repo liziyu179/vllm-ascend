@@ -1104,6 +1104,183 @@ class NPUModelRunner(GPUModelRunner):
 
         return draft_token_ids
 
+    def _get_runner_kv_cache_entries(self) -> list[tuple[str, KVCacheSpec, int]]:
+        from vllm.model_executor.models.utils import extract_layer_index
+        index2entry: dict[int, list[tuple[str, KVCacheSpec, int]]] = defaultdict(list)
+        num_attn_module = (
+            2 if self.model_config.hf_text_config.model_type == "longcat_flash" else 1
+        )
+
+        for group in self._kv_cache_spec_attn_group_iterator():
+            for layer_name in group.layer_names:
+                if layer_name in self.runner_only_attn_layers:
+                    continue
+                index2entry[extract_layer_index(layer_name, num_attn_module)].append(
+                    (
+                        layer_name,
+                        group.kv_cache_spec,
+                        group.kv_cache_group_id,
+                    )
+                )
+
+        entries: list[tuple[str, KVCacheSpec, int]] = []
+        for layer_index in sorted(index2entry.keys()):
+            entries.extend(index2entry[layer_index])
+        return entries
+
+    def _iter_kv_cache_entries(self):
+        if not getattr(self, "kv_cache_config", None):
+            return
+
+        runner_kv_cache_entries = self._get_runner_kv_cache_entries()
+
+        for layer_idx, kv_cache in enumerate(self.kv_caches):
+            if layer_idx >= len(runner_kv_cache_entries):
+                continue
+            layer_name, kv_cache_spec, kv_cache_group_id = runner_kv_cache_entries[
+                layer_idx
+            ]
+            yield layer_idx, layer_name, kv_cache, kv_cache_spec, kv_cache_group_id
+
+    def _iter_attention_kv_cache_entries(self):
+        for (
+            layer_idx,
+            layer_name,
+            kv_cache,
+            kv_cache_spec,
+            kv_cache_group_id,
+        ) in self._iter_kv_cache_entries():
+            if not isinstance(kv_cache_spec, AttentionSpec):
+                continue
+            if not isinstance(kv_cache, (tuple, list)) or len(kv_cache) < 2:
+                continue
+            yield layer_idx, layer_name, kv_cache, kv_cache_group_id
+
+    def _iter_mamba_kv_cache_entries(self):
+        for (
+            layer_idx,
+            layer_name,
+            kv_cache,
+            kv_cache_spec,
+            kv_cache_group_id,
+        ) in self._iter_kv_cache_entries():
+            if not isinstance(kv_cache_spec, MambaSpec):
+                continue
+            if not isinstance(kv_cache, (tuple, list)) or len(kv_cache) == 0:
+                continue
+            yield layer_idx, layer_name, kv_cache, kv_cache_spec, kv_cache_group_id
+
+    def _log_attention_kv_cache_stats(
+        self,
+        req_ids: list[str],
+        tokens: list[int] | None,
+        *,
+        log_prefix: str,
+        include_last_token: bool,
+    ) -> None:
+        for layer_idx, layer_name, kv_cache, kv_cache_group_id in self._iter_attention_kv_cache_entries():
+            block_table = self.input_batch.block_table[kv_cache_group_id]
+            for req_idx, req_id in enumerate(req_ids):
+                kv_len = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+                if tokens is not None:
+                    kv_len += tokens[req_idx]
+                if not include_last_token:
+                    kv_len -= 1
+                if kv_len <= 0:
+                    continue
+
+                block_ids = block_table.block_table.gpu[req_idx, : cdiv(kv_len, block_table.block_size)]
+                offsets = torch.arange(kv_len, device=self.device) % block_table.block_size
+                slots = (
+                    block_ids.repeat_interleave(block_table.block_size)[:kv_len].to(torch.long)
+                    * block_table.block_size
+                    + offsets
+                )
+
+                k_cache = kv_cache[0].reshape(-1, *kv_cache[0].shape[2:]).index_select(0, slots).float()
+                v_cache = kv_cache[1].reshape(-1, *kv_cache[1].shape[2:]).index_select(0, slots).float()
+                logger.info(
+                    "%s: req_id=%s layer_idx=%d layer_name=%s kv_len=%d "
+                    "k_cache_shape=%s v_cache_shape=%s block_ids=%s "
+                    "k_mean=%s k_var=%s v_mean=%s v_var=%s",
+                    log_prefix,
+                    req_id,
+                    layer_idx,
+                    layer_name,
+                    kv_len,
+                    tuple(kv_cache[0].shape),
+                    tuple(kv_cache[1].shape),
+                    block_ids.tolist(),
+                    k_cache.mean().item(),
+                    k_cache.var(unbiased=False).item(),
+                    v_cache.mean().item(),
+                    v_cache.var(unbiased=False).item(),
+                )
+
+        for (
+            layer_idx,
+            layer_name,
+            kv_cache,
+            kv_cache_spec,
+            kv_cache_group_id,
+        ) in self._iter_mamba_kv_cache_entries():
+            block_table = self.input_batch.block_table[kv_cache_group_id]
+            for req_idx, req_id in enumerate(req_ids):
+                kv_len = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+                if tokens is not None:
+                    kv_len += tokens[req_idx]
+                if kv_len == 0:
+                    continue
+
+                if kv_cache_spec.mamba_cache_mode == "align":
+                    state_block_idx = self.mamba_state_idx.get(req_id)
+                    if state_block_idx is None:
+                        state_block_idx = (
+                            int(block_table.num_blocks_per_row[req_idx])
+                            - kv_cache_spec.num_speculative_blocks
+                            - 1
+                        )
+                else:
+                    state_block_idx = 0
+                if (
+                    state_block_idx < 0
+                    or state_block_idx >= block_table.block_table.gpu.shape[1]
+                ):
+                    continue
+
+                block_id = block_table.block_table.gpu[req_idx, state_block_idx].to(
+                    torch.long
+                )
+                block_id_value = block_id.item()
+                if block_id_value < 0:
+                    continue
+                state_stats = []
+                state_shapes = []
+                for state_idx, state_cache in enumerate(kv_cache):
+                    state_shapes.append(tuple(state_cache.shape))
+                    state = state_cache.index_select(0, block_id.view(1)).float()
+                    state_stats.append(
+                        "state%d_mean=%s state%d_var=%s"
+                        % (
+                            state_idx,
+                            state.mean().item(),
+                            state_idx,
+                            state.var(unbiased=False).item(),
+                        )
+                    )
+                logger.info(
+                    "%s: req_id=%s layer_idx=%d layer_name=%s kv_len=%d "
+                    "mamba_state_shapes=%s mamba_block_id=%s %s",
+                    log_prefix,
+                    req_id,
+                    layer_idx,
+                    layer_name,
+                    kv_len,
+                    state_shapes,
+                    block_id_value,
+                    " ".join(state_stats),
+                )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1351,50 +1528,26 @@ class NPUModelRunner(GPUModelRunner):
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
-                **(
-                    {"defer_finalize": not clear_kv_metadata}
-                ),
+                **({"defer_finalize": not clear_kv_metadata}),
             ) as kv_connector_output,
         ):
-            for layer_idx, kv_cache in enumerate(self.kv_caches):
-                if isinstance(kv_cache, (tuple, list)) and len(kv_cache) >= 2:
-                    block_table = self.input_batch.block_table[0]
-                    for req_idx, req_id in enumerate(req_ids):
-                        kv_len = int(self.input_batch.num_computed_tokens_cpu[req_idx])
-                        if kv_len == 0:
-                            continue
-                        block_ids = block_table.block_table.gpu[req_idx, :cdiv(kv_len, block_table.block_size)]
-                        offsets = torch.arange(kv_len, device=self.device) % block_table.block_size
-                        slots = (block_ids.repeat_interleave(block_table.block_size)[:kv_len].to(torch.long)
-                                * block_table.block_size + offsets)
-                        k_cache = kv_cache[0].reshape(-1, *kv_cache[0].shape[2:]).index_select(0, slots).float()
-                        v_cache = kv_cache[1].reshape(-1, *kv_cache[1].shape[2:]).index_select(0, slots).float()
-                        logger.info("KV cache stats: req_id=%s layer_idx=%d kv_len=%d k_mean=%s k_var=%s "
-                                    "v_mean=%s v_var=%s", req_id, layer_idx, kv_len, k_cache.mean().item(),
-                                    k_cache.var(unbiased=False).item(), v_cache.mean().item(),
-                                    v_cache.var(unbiased=False).item())
+            self._log_attention_kv_cache_stats(
+                req_ids,
+                None,
+                log_prefix="KV cache stats",
+                include_last_token=True,
+            )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
         if self.is_kv_producer:
             torch.npu.synchronize()
-            block_table = self.input_batch.block_table[0]
-            for layer_idx, kv_cache in enumerate(self.kv_caches):
-                if isinstance(kv_cache, (tuple, list)) and len(kv_cache) >= 2:
-                    for req_idx, req_id in enumerate(req_ids):
-                        kv_len = int(self.input_batch.num_computed_tokens_cpu[req_idx]) + tokens[req_idx]
-                        if kv_len == 0:
-                            continue
-                        block_ids = block_table.block_table.gpu[req_idx, :cdiv(kv_len, block_table.block_size)]
-                        offsets = torch.arange(kv_len, device=self.device) % block_table.block_size
-                        slots = (block_ids.repeat_interleave(block_table.block_size)[:kv_len].to(torch.long)
-                                * block_table.block_size + offsets)
-                        k_cache = kv_cache[0].reshape(-1, *kv_cache[0].shape[2:]).index_select(0, slots[:-1]).float()
-                        v_cache = kv_cache[1].reshape(-1, *kv_cache[1].shape[2:]).index_select(0, slots[:-1]).float()
-                        logger.info("P node generated KV cache stats: req_id=%s layer_idx=%d kv_len=%d "
-                                    "k_mean=%s k_var=%s v_mean=%s v_var=%s", req_id, layer_idx, kv_len-1,
-                                    k_cache.mean().item(), k_cache.var(unbiased=False).item(),
-                                    v_cache.mean().item(), v_cache.var(unbiased=False).item())
+            self._log_attention_kv_cache_stats(
+                req_ids,
+                tokens,
+                log_prefix="P node generated KV cache stats",
+                include_last_token=self.use_hybrid_blocks,
+            )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
