@@ -617,18 +617,35 @@ class KVCacheRecvingThread(threading.Thread):
         is_kv_transfer_end = global_offset == tp_num_need_pulls * self._prefill_pp_size - 1
         need_cat_cache = tp_num_need_pulls > 1 and is_kv_transfer_end
         need_nz_cache = get_ascend_config().enable_kv_nz and is_kv_transfer_end
-        use_fused_op = ascend_envs.VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK
         if need_nz_cache or need_cat_cache:
-            # use fused op to reformat kv cache, we keep original implementation to provide ability to disable it.
-            if use_fused_op and enable_custom_op():
-                if need_cat_cache:
-                    # the fused op only support cat GQA/MHA kv cache by head
+            if need_cat_cache:
+                backend = self._get_transpose_kv_cache_backend()
+                if backend == "ascendc":
                     self.reformat_kv_cache_with_fused_op(grouped_local_block_ids, tp_num_need_pulls)
-                if need_nz_cache:
-                    # maybe use fused op to reformat kv nz too in the future.
-                    self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, False, need_nz_cache)
-            else:
-                self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, need_cat_cache, need_nz_cache)
+                elif backend == "triton":
+                    self.reformat_kv_cache_with_triton(grouped_local_block_ids, tp_num_need_pulls)
+                else:
+                    self.reformat_kv_cache_with_torch(grouped_local_block_ids, tp_num_need_pulls)
+            if need_nz_cache:
+                # maybe use fused op to reformat kv nz too in the future.
+                self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, False, need_nz_cache)
+
+    def _get_transpose_kv_cache_backend(self) -> str:
+        backend = ascend_envs.VLLM_ASCEND_TRANSPOSE_KV_CACHE_BACKEND
+        if backend:
+            if backend not in ("ascendc", "triton", "torch"):
+                raise ValueError(
+                    "VLLM_ASCEND_TRANSPOSE_KV_CACHE_BACKEND must be one of "
+                    f"'ascendc', 'triton', or 'torch', got {backend!r}"
+                )
+            if backend == "ascendc" and not enable_custom_op():
+                logger.warning_once("AscendC transpose_kv_cache_by_block is unavailable; falling back to torch.")
+                return "torch"
+            return backend
+
+        if ascend_envs.VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK and enable_custom_op():
+            return "ascendc"
+        return "torch"
 
     def reformat_kv_cache_with_fused_op(self, block_ids: list[list[int]], tp_num_need_pulls: int):
         # Get necessary parameters
@@ -650,6 +667,51 @@ class KVCacheRecvingThread(threading.Thread):
         torch.ops._C_ascend.transpose_kv_cache_by_block(
             k_caches, v_caches, block_ids_tensor, block_size, num_kv_head, head_dim, tp_num_need_pulls, layers
         )
+
+    def reformat_kv_cache_with_triton(self, block_ids: list[list[int]], tp_num_need_pulls: int):
+        from vllm_ascend.ops.triton.transpose_kv_cache_by_block import transpose_kv_cache_by_block_triton
+
+        flat_block_ids = [item for sublist in block_ids for item in sublist]
+        if not flat_block_ids or tp_num_need_pulls == 1:
+            return
+
+        device = list(self.kv_caches.values())[0][0].device
+        block_ids_tensor = torch.tensor(flat_block_ids, dtype=torch.int64, device=device)
+
+        k_caches = []
+        v_caches = []
+        for _, (k_cache_layer, v_cache_layer) in self.kv_caches.items():
+            k_caches.append(k_cache_layer)
+            v_caches.append(v_cache_layer)
+
+        transpose_kv_cache_by_block_triton(k_caches, v_caches, block_ids_tensor, self.block_size, tp_num_need_pulls)
+
+    @torch.no_grad()
+    def reformat_kv_cache_with_torch(self, block_ids: list[list[int]], tp_num_need_pulls: int):
+        flat_block_ids = [item for sublist in block_ids for item in sublist]
+        if not flat_block_ids or tp_num_need_pulls == 1:
+            return
+
+        device = list(self.kv_caches.values())[0][0].device
+        block_ids_tensor = torch.tensor(flat_block_ids, dtype=torch.long, device=device)
+        num_blocks = block_ids_tensor.numel()
+
+        def _transpose_cache_by_block(cache: torch.Tensor):
+            # The transferred cache is laid out as
+            # [block, split, token, head_per_split, dim]. Restore it to
+            # [block, token, split, head_per_split, dim] in the selected blocks.
+            selected = cache.index_select(0, block_ids_tensor)
+            transposed = (
+                selected.reshape(num_blocks, tp_num_need_pulls, self.block_size, -1)
+                .transpose(1, 2)
+                .contiguous()
+                .reshape_as(selected)
+            )
+            cache.index_copy_(0, block_ids_tensor, transposed)
+
+        for _, (k_cache_layer, v_cache_layer) in self.kv_caches.items():
+            _transpose_cache_by_block(k_cache_layer)
+            _transpose_cache_by_block(v_cache_layer)
 
     def reformat_kv_cache(
         self,
