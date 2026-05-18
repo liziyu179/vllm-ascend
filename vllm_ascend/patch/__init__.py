@@ -297,19 +297,6 @@
 #    Future Plan:
 #       Remove this patch when the refactor of all2all manager is done.
 #
-# ** 2. File: worker/patch_bert.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.model_executor.models.bert._encode_token_type_ids`
-#      `vllm.model_executor.models.bert._decode_token_type_ids`
-#    Why:
-#       shift operation in `_encode_token_type_ids` and `_decode_token_type_ids` cannot run in ascend aclgraph mode
-#    How：
-#       Replace shift operation with multiplication and division.
-#    Related PR (if no, explain why):
-#       No, this need CANN add an aclnn shift operation
-#    Future Plan:
-#       Revert this when CANN support shift aclnn operation
-#
 # ** 3. File: worker/patch_triton.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.model_executor.layers.mamba.ops`, `vllm.model_executor.layers.fla.ops`,
@@ -413,16 +400,6 @@
 #    Future Plan:
 #       Remove this patch when vLLM support these operators.
 #
-# ** 9. File: worker/patch_huanyuan_vl.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.transformers_utils.processors.hunyuan_vl.HunYuanVLProcessor.__call__`
-#    Why:
-#       The `add_special_tokens` parameter is not supported by default in the processor.
-#    How：
-#       Remove the `add_special_tokens` parameter from kwargs before calling the original method.
-#    Future Plan:
-#       Remove this patch when vLLM aligns with the latest processor implementation.
-#
 # ** 10. File: worker/patch_qwen3vl.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.model_executor.models.qwen3_vl.Qwen3VLForConditionalGeneration._get_deepstack_input_embeds`
@@ -432,6 +409,18 @@
 #       override _get_deepstack_input_embeds method with the flash comm v1 implementation.
 #    Future Plan:
 #       Remove this patch when https://github.com/vllm-project/vllm-ascend/issues/5712 is completed.
+#   2. `vllm.model_executor.models.qwen3_vl_moe.Qwen3MoeLLMForCausalLM.start_layer`,
+#      `vllm.model_executor.models.qwen3_vl_moe.Qwen3MoeLLMForCausalLM.end_layer`
+#    Why:
+#       Qwen3-VL-MoE checks the language-model pipeline boundary on non-first
+#       PP ranks, but Qwen3MoeLLMForCausalLM keeps start_layer/end_layer only
+#       on the inner model object.
+#    How:
+#       Expose start_layer/end_layer properties on Qwen3MoeLLMForCausalLM and
+#       forward them to the inner model.
+#    Future Plan:
+#       Remove this patch when upstream vLLM exposes these PP layer boundaries
+#       on the Qwen3-VL-MoE language-model wrapper.
 #
 # ** 11. File: worker/patch_npugraph_ex_triton.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
