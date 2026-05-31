@@ -22,6 +22,9 @@ def _transpose_to_workspace_kernel(
     heads_per_split: tl.constexpr,
     head_dim: tl.constexpr,
     dim_block: tl.constexpr,
+    dim_tile_count: tl.constexpr,
+    token_head_count: tl.constexpr,
+    total_tasks: tl.constexpr,
 ):
     """
     第一阶段：把一个 cache block 按最终布局搬到 workspace。
@@ -47,35 +50,42 @@ def _transpose_to_workspace_kernel(
     (token, head, dim)，再拆出 (split, head_in_split)，到源布局中的
     (split, token, head_in_split, dim) 位置读取。
     """
-    dim_tile_id = tl.program_id(0)
-    token_head_idx = tl.program_id(1)
-    block_idx = tl.program_id(2)
+    task_id = tl.program_id(0)
+    task_stride = tl.num_programs(0)
 
-    dim_offsets = dim_tile_id * dim_block + tl.arange(0, dim_block)
-    mask = dim_offsets < head_dim
-    safe_dim_offsets = tl.minimum(dim_offsets, head_dim - 1)
+    while task_id < total_tasks:
+        dim_tile_id = task_id % dim_tile_count
+        token_head_block_idx = task_id // dim_tile_count
+        token_head_idx = token_head_block_idx % token_head_count
+        block_idx = token_head_block_idx // token_head_count
 
-    block_id = tl.load(block_ids + block_idx)
-    token_idx = token_head_idx // head_num
-    head_idx = token_head_idx - token_idx * head_num
-    split_idx = head_idx // heads_per_split
-    head_idx_in_split = head_idx - split_idx * heads_per_split
+        dim_offsets = dim_tile_id * dim_block + tl.arange(0, dim_block)
+        mask = dim_offsets < head_dim
+        safe_dim_offsets = tl.minimum(dim_offsets, head_dim - 1)
 
-    # 每个 program 只搬一个 (token, head) 的 head_dim 连续片段。
-    # 这样源和目标都是连续访存，避免在 NPU 上生成大跨度 gather。
-    src_offsets = (
-        block_id * block_num_stride
-        + split_idx * block_size * heads_per_split * head_dim
-        + token_idx * heads_per_split * head_dim
-        + head_idx_in_split * head_dim
-        + safe_dim_offsets
-    )
-    workspace_offsets = (
-        block_idx * block_num_stride + token_idx * head_num * head_dim + head_idx * head_dim + safe_dim_offsets
-    )
+        block_id = tl.load(block_ids + block_idx)
+        token_idx = token_head_idx // head_num
+        head_idx = token_head_idx - token_idx * head_num
+        split_idx = head_idx // heads_per_split
+        head_idx_in_split = head_idx - split_idx * heads_per_split
 
-    values = tl.load(cache + src_offsets, mask=mask, other=0.0)
-    tl.store(workspace + workspace_offsets, values, mask=mask)
+        # 每个 task 只搬一个 (token, head) 的 head_dim 连续片段。
+        # 这样源和目标都是连续访存，避免在 NPU 上生成大跨度 gather。
+        src_offsets = (
+            block_id * block_num_stride
+            + split_idx * block_size * heads_per_split * head_dim
+            + token_idx * heads_per_split * head_dim
+            + head_idx_in_split * head_dim
+            + safe_dim_offsets
+        )
+        workspace_offsets = (
+            block_idx * block_num_stride + token_idx * head_num * head_dim + head_idx * head_dim + safe_dim_offsets
+        )
+
+        values = tl.load(cache + src_offsets, mask=mask, other=0.0)
+        tl.store(workspace + workspace_offsets, values, mask=mask)
+
+        task_id += task_stride
 
 
 @triton.jit
@@ -86,6 +96,8 @@ def _copy_workspace_back_kernel(
     block_num_stride: tl.constexpr,
     total_elems: tl.constexpr,
     block_elems: tl.constexpr,
+    tile_count: tl.constexpr,
+    total_tasks: tl.constexpr,
 ):
     """
     第二阶段：把 workspace 中已经排好的最终布局写回原 cache block。
@@ -94,19 +106,25 @@ def _copy_workspace_back_kernel(
     内部没有的全局同步点；执行到本 kernel 时，所有源数据都已经在第一阶段读取完，
     因而可以安全覆盖原 cache。
     """
-    tile_id = tl.program_id(0)
-    block_idx = tl.program_id(1)
+    task_id = tl.program_id(0)
+    task_stride = tl.num_programs(0)
 
-    offsets = tile_id * block_elems + tl.arange(0, block_elems)
-    mask = offsets < total_elems
-    safe_offsets = tl.minimum(offsets, total_elems - 1)
+    while task_id < total_tasks:
+        tile_id = task_id % tile_count
+        block_idx = task_id // tile_count
 
-    block_id = tl.load(block_ids + block_idx)
-    cache_offsets = block_id * block_num_stride + safe_offsets
-    workspace_offsets = block_idx * block_num_stride + safe_offsets
+        offsets = tile_id * block_elems + tl.arange(0, block_elems)
+        mask = offsets < total_elems
+        safe_offsets = tl.minimum(offsets, total_elems - 1)
 
-    values = tl.load(workspace + workspace_offsets, mask=mask, other=0.0)
-    tl.store(cache + cache_offsets, values, mask=mask)
+        block_id = tl.load(block_ids + block_idx)
+        cache_offsets = block_id * block_num_stride + safe_offsets
+        workspace_offsets = block_idx * block_num_stride + safe_offsets
+
+        values = tl.load(workspace + workspace_offsets, mask=mask, other=0.0)
+        tl.store(cache + cache_offsets, values, mask=mask)
+
+        task_id += task_stride
 
 
 def _check_cache(
@@ -167,11 +185,10 @@ def _run_for_cache(
         device=cache.device,
     )
 
-    transpose_grid = (
-        triton.cdiv(head_dim, dim_block),
-        block_size * head_num,
-        block_ids.numel(),
-    )
+    dim_tile_count = triton.cdiv(head_dim, dim_block)
+    token_head_count = block_size * head_num
+    transpose_tasks = block_ids.numel() * token_head_count * dim_tile_count
+    transpose_grid = (min(transpose_tasks, MAX_THREADS),)
     _transpose_to_workspace_kernel[transpose_grid](
         cache,
         block_ids,
@@ -183,9 +200,14 @@ def _run_for_cache(
         heads_per_split,
         head_dim,
         dim_block,
+        dim_tile_count,
+        token_head_count,
+        transpose_tasks,
     )
 
-    copy_grid = (triton.cdiv(total_elems, block_elems), block_ids.numel())
+    copy_tile_count = triton.cdiv(total_elems, block_elems)
+    copy_tasks = block_ids.numel() * copy_tile_count
+    copy_grid = (min(copy_tasks, MAX_THREADS),)
     _copy_workspace_back_kernel[copy_grid](
         cache,
         block_ids,
@@ -193,6 +215,8 @@ def _run_for_cache(
         block_num_stride,
         total_elems,
         block_elems,
+        copy_tile_count,
+        copy_tasks,
     )
 
 
@@ -214,8 +238,8 @@ def transpose_kv_cache_by_block_triton(
     if split_num == 1 or block_ids.numel() == 0:
         return
 
-    if block_ids.dtype != torch.int64:
-        block_ids = block_ids.to(dtype=torch.int64)
+    if block_ids.dtype != torch.int32:
+        block_ids = block_ids.to(dtype=torch.int32)
     if not block_ids.is_contiguous():
         block_ids = block_ids.contiguous()
 
