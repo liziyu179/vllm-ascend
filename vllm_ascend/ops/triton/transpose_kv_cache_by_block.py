@@ -4,108 +4,65 @@
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-# Keep the per-program vector small enough for Ascend vector-core UB usage.
-TILE_ELEMS = 1024
+# Keep the per-program vector bounded for Ascend vector-core UB usage. The
+# no-workspace implementation needs one program to own a full cache block to
+# avoid in-place overwrite hazards across programs.
+MAX_FULL_BLOCK_ELEMS = 131072
 MAX_PROGRAMS = 40
 
 
 @triton.jit
-def _transpose_to_workspace_kernel(
+def _transpose_block_inplace_kernel(
     cache,
     block_ids,
-    workspace,
     block_stride: tl.constexpr,
+    elems_per_block: tl.constexpr,
     block_size: tl.constexpr,
     head_num: tl.constexpr,
     heads_per_split: tl.constexpr,
     head_dim: tl.constexpr,
-    dim_tile_elems: tl.constexpr,
-    dim_tile_count: tl.constexpr,
-    token_head_count: tl.constexpr,
-    total_tasks: tl.constexpr,
+    vector_elems: tl.constexpr,
+    selected_block_count: tl.constexpr,
 ):
     """
-    Stage 1: read selected cache blocks as
+    Read one selected cache block as
         [split_num, block_size, head_num / split_num, head_dim]
-    and write workspace as
+    and write it back in-place as
         [block_size, head_num, head_dim].
 
-    One task copies one contiguous dim tile for one (token, head) pair in one
-    selected cache block. This keeps both source and destination accesses
-    contiguous inside each vector load/store.
+    One program owns a full cache block. This keeps all reads for the block in
+    the same program before the in-place stores, avoiding the cross-program
+    overwrite hazard that would require a workspace or a global barrier.
     """
-    task_id = tl.program_id(0)
-    task_stride = tl.num_programs(0)
+    selected_block_idx = tl.program_id(0)
+    selected_block_stride = tl.num_programs(0)
 
-    while task_id < total_tasks:
-        dim_tile_idx = task_id % dim_tile_count
-        token_head_block_idx = task_id // dim_tile_count
-        token_head_idx = token_head_block_idx % token_head_count
-        selected_block_idx = token_head_block_idx // token_head_count
-
-        dim_offsets = dim_tile_idx * dim_tile_elems + tl.arange(0, dim_tile_elems)
-        dim_mask = dim_offsets < head_dim
-        safe_dim_offsets = tl.minimum(dim_offsets, head_dim - 1)
-
-        token_idx = token_head_idx // head_num
-        head_idx = token_head_idx - token_idx * head_num
-        split_idx = head_idx // heads_per_split
-        head_idx_in_split = head_idx - split_idx * heads_per_split
-
-        cache_block_id = tl.load(block_ids + selected_block_idx)
-
-        src_offsets = (
-            cache_block_id * block_stride
-            + split_idx * block_size * heads_per_split * head_dim
-            + token_idx * heads_per_split * head_dim
-            + head_idx_in_split * head_dim
-            + safe_dim_offsets
-        )
-        dst_offsets = (
-            selected_block_idx * block_stride + token_idx * head_num * head_dim + head_idx * head_dim + safe_dim_offsets
-        )
-
-        values = tl.load(cache + src_offsets, mask=dim_mask, other=0.0)
-        tl.store(workspace + dst_offsets, values, mask=dim_mask)
-
-        task_id += task_stride
-
-
-@triton.jit
-def _copy_workspace_back_kernel(
-    cache,
-    block_ids,
-    workspace,
-    block_stride: tl.constexpr,
-    elems_per_block: tl.constexpr,
-    tile_elems: tl.constexpr,
-    tile_count: tl.constexpr,
-    total_tasks: tl.constexpr,
-):
-    """
-    Stage 2: copy already-transposed workspace blocks back to the selected
-    cache blocks. Kernel launch ordering provides the global sync between
-    stage 1 reads and stage 2 overwrites.
-    """
-    task_id = tl.program_id(0)
-    task_stride = tl.num_programs(0)
-
-    while task_id < total_tasks:
-        tile_idx = task_id % tile_count
-        selected_block_idx = task_id // tile_count
-
-        offsets = tile_idx * tile_elems + tl.arange(0, tile_elems)
+    while selected_block_idx < selected_block_count:
+        offsets = tl.arange(0, vector_elems)
         mask = offsets < elems_per_block
         safe_offsets = tl.minimum(offsets, elems_per_block - 1)
 
-        cache_block_id = tl.load(block_ids + selected_block_idx)
-        src_offsets = selected_block_idx * block_stride + safe_offsets
-        dst_offsets = cache_block_id * block_stride + safe_offsets
+        dim_idx = safe_offsets % head_dim
+        head_token_idx = safe_offsets // head_dim
+        head_idx = head_token_idx % head_num
+        token_idx = head_token_idx // head_num
+        split_idx = head_idx // heads_per_split
+        head_idx_in_split = head_idx - split_idx * heads_per_split
 
-        values = tl.load(workspace + src_offsets, mask=mask, other=0.0)
-        tl.store(cache + dst_offsets, values, mask=mask)
+        src_offsets = (
+            split_idx * block_size * heads_per_split * head_dim
+            + token_idx * heads_per_split * head_dim
+            + head_idx_in_split * head_dim
+            + dim_idx
+        )
 
-        task_id += task_stride
+        cache_block_id = tl.load(block_ids + selected_block_idx).to(tl.int64)
+        block_base = cache_block_id * block_stride
+
+        values = tl.load(cache + block_base + src_offsets, mask=mask, other=0.0)
+        tl.store(cache + block_base + safe_offsets, values, mask=mask)
+
+        selected_block_idx += selected_block_stride
 
 
 def _check_cache(
@@ -122,6 +79,7 @@ def _check_cache(
     assert head_num % split_num == 0, f"head_num={head_num} must be divisible by split_num={split_num}"
     assert block_size == cache.shape[1], f"block_size={block_size} does not match cache.shape[1]={cache.shape[1]}"
     assert block_ids.device == cache.device
+    assert block_ids.dtype in (torch.int32, torch.int64), f"block_ids must be int32 or int64, got {block_ids.dtype}"
 
     heads_per_split = head_num // split_num
     elems_per_block = block_size * head_num * head_dim
@@ -135,48 +93,29 @@ def _run_for_cache(
     split_num: int,
 ) -> None:
     head_num, heads_per_split, head_dim, elems_per_block = _check_cache(cache, block_ids, block_size, split_num)
+    if elems_per_block > MAX_FULL_BLOCK_ELEMS:
+        raise ValueError(
+            "transpose_kv_cache_by_block_triton no-workspace path requires "
+            f"elems_per_block <= {MAX_FULL_BLOCK_ELEMS}, got {elems_per_block}. "
+            "Splitting a block across programs would need a workspace or a global barrier to avoid in-place overwrite."
+        )
 
     block_stride = cache.stride(0)
-    dim_tile_elems = min(head_dim, TILE_ELEMS)
-    dim_tile_count = triton.cdiv(head_dim, dim_tile_elems)
-    token_head_count = block_size * head_num
     selected_block_count = block_ids.numel()
+    vector_elems = triton.next_power_of_2(elems_per_block)
 
-    workspace = torch.empty(
-        (selected_block_count, block_stride),
-        dtype=cache.dtype,
-        device=cache.device,
-    )
-
-    transpose_tasks = selected_block_count * token_head_count * dim_tile_count
-    transpose_grid = (min(transpose_tasks, MAX_PROGRAMS),)
-    _transpose_to_workspace_kernel[transpose_grid](
+    grid = (min(selected_block_count, MAX_PROGRAMS),)
+    _transpose_block_inplace_kernel[grid](
         cache,
         block_ids,
-        workspace,
         block_stride,
+        elems_per_block,
         block_size,
         head_num,
         heads_per_split,
         head_dim,
-        dim_tile_elems,
-        dim_tile_count,
-        token_head_count,
-        transpose_tasks,
-    )
-
-    copy_tile_count = triton.cdiv(elems_per_block, TILE_ELEMS)
-    copy_tasks = selected_block_count * copy_tile_count
-    copy_grid = (min(copy_tasks, MAX_PROGRAMS),)
-    _copy_workspace_back_kernel[copy_grid](
-        cache,
-        block_ids,
-        workspace,
-        block_stride,
-        elems_per_block,
-        TILE_ELEMS,
-        copy_tile_count,
-        copy_tasks,
+        vector_elems,
+        selected_block_count,
     )
 
 
@@ -197,8 +136,6 @@ def transpose_kv_cache_by_block_triton(
     if split_num == 1 or block_ids.numel() == 0:
         return
 
-    if block_ids.dtype != torch.int32:
-        block_ids = block_ids.to(dtype=torch.int32)
     if not block_ids.is_contiguous():
         block_ids = block_ids.contiguous()
 
