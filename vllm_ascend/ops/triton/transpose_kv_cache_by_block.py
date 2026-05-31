@@ -52,6 +52,7 @@ def _transpose_to_workspace_kernel(
 
     offsets = tile_id * block_elems + tl.arange(0, block_elems)
     mask = offsets < total_elems
+    safe_offsets = tl.minimum(offsets, total_elems - 1)
 
     block_id = tl.load(block_ids + block_idx)
     # 目标线性布局：
@@ -60,8 +61,8 @@ def _transpose_to_workspace_kernel(
     #       + head * head_dim
     #       + dim
     head_num = split_num * heads_per_split
-    dst_head_cell = offsets // head_dim
-    dim_idx = offsets - dst_head_cell * head_dim
+    dst_head_cell = safe_offsets // head_dim
+    dim_idx = safe_offsets - dst_head_cell * head_dim
     token_idx = dst_head_cell // head_num
     head_idx = dst_head_cell - token_idx * head_num
     split_idx = head_idx // heads_per_split
@@ -80,9 +81,9 @@ def _transpose_to_workspace_kernel(
         + head_idx_in_split * head_dim
         + dim_idx
     )
-    workspace_offsets = block_idx * block_num_stride + offsets
+    workspace_offsets = block_idx * block_num_stride + safe_offsets
 
-    values = tl.load(cache + src_offsets, mask=mask)
+    values = tl.load(cache + src_offsets, mask=mask, other=0.0)
     tl.store(workspace + workspace_offsets, values, mask=mask)
 
 
@@ -107,12 +108,13 @@ def _copy_workspace_back_kernel(
 
     offsets = tile_id * block_elems + tl.arange(0, block_elems)
     mask = offsets < total_elems
+    safe_offsets = tl.minimum(offsets, total_elems - 1)
 
     block_id = tl.load(block_ids + block_idx)
-    cache_offsets = block_id * block_num_stride + offsets
-    workspace_offsets = block_idx * block_num_stride + offsets
+    cache_offsets = block_id * block_num_stride + safe_offsets
+    workspace_offsets = block_idx * block_num_stride + safe_offsets
 
-    values = tl.load(workspace + workspace_offsets, mask=mask)
+    values = tl.load(workspace + workspace_offsets, mask=mask, other=0.0)
     tl.store(cache + cache_offsets, values, mask=mask)
 
 
