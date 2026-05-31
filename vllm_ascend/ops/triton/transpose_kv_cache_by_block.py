@@ -4,9 +4,9 @@
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-# 当前硬件约束：最多 40 个 program 并发参与搬运，并共享 192 KiB UB。
-# 因此每个 program 的向量搬运粒度需要按该预算计算，尽可能提高 UB 利用率。
-UB_SIZE_BYTES = 192 * 1024
+# NPU vector core 的 UB 只有 192 KiB。这里固定使用 1024 个元素作为
+# 单个 program 的搬运粒度，给 Triton lowering 和运行时临时开销留余量。
+TILE_ELEMS = 1024
 MAX_THREADS = 40
 
 
@@ -147,24 +147,8 @@ def _check_cache(
     return head_num, heads_per_split, head_dim, total_elems
 
 
-def _previous_power_of_2(value: int) -> int:
-    return 1 << (value.bit_length() - 1)
-
-
-def _get_block_elems(element_size: int) -> int:
-    # 硬件预算是 192 KiB UB，最多 40 个 program 并发共享，因此每个 program
-    # 约可使用 UB_SIZE_BYTES / MAX_THREADS 字节。
-    #
-    # tl.arange 需要编译期常量，并且通常更适合 2 的幂大小。这里取不超过
-    # 单 program 字节预算的最大 2 次幂。对 fp16/bf16 来说，block_elems 为
-    # 2048，即每个 program 4096 字节；40 个 program 总共约 160 KiB，
-    # 给编译器和运行时开销留出一定余量。
-    per_program_bytes = max(element_size, UB_SIZE_BYTES // MAX_THREADS)
-    return max(1, _previous_power_of_2(per_program_bytes // element_size))
-
-
-def _get_dim_block(head_dim: int, element_size: int) -> int:
-    return min(head_dim, _get_block_elems(element_size))
+def _get_dim_block(head_dim: int) -> int:
+    return min(head_dim, TILE_ELEMS)
 
 
 def _run_for_cache(
@@ -175,9 +159,8 @@ def _run_for_cache(
 ) -> None:
     head_num, heads_per_split, head_dim, total_elems = _check_cache(cache, block_ids, block_size, split_num)
     block_num_stride = cache.stride(0)
-    element_size = cache.element_size()
-    block_elems = _get_block_elems(element_size)
-    dim_block = _get_dim_block(head_dim, element_size)
+    block_elems = TILE_ELEMS
+    dim_block = _get_dim_block(head_dim)
 
     workspace = torch.empty(
         (block_ids.numel(), block_num_stride),
