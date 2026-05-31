@@ -20,9 +20,8 @@ def _transpose_to_workspace_kernel(
     split_num: tl.constexpr,
     heads_per_split: tl.constexpr,
     head_dim: tl.constexpr,
-    total_bytes: tl.constexpr,
-    element_size: tl.constexpr,
-    block_bytes: tl.constexpr,
+    total_elems: tl.constexpr,
+    block_elems: tl.constexpr,
 ):
     """
     第一阶段：把一个 cache block 按最终布局搬到 workspace。
@@ -51,11 +50,9 @@ def _transpose_to_workspace_kernel(
     tile_id = tl.program_id(0)
     block_idx = tl.program_id(1)
 
-    byte_offsets = tile_id * block_bytes + tl.arange(0, block_bytes)
-    mask = byte_offsets < total_bytes
-    safe_byte_offsets = tl.minimum(byte_offsets, total_bytes - 1)
-    elem_offsets = safe_byte_offsets // element_size
-    elem_byte_offsets = safe_byte_offsets - elem_offsets * element_size
+    offsets = tile_id * block_elems + tl.arange(0, block_elems)
+    mask = offsets < total_elems
+    safe_offsets = tl.minimum(offsets, total_elems - 1)
 
     block_id = tl.load(block_ids + block_idx)
     # 目标线性布局：
@@ -64,8 +61,8 @@ def _transpose_to_workspace_kernel(
     #       + head * head_dim
     #       + dim
     head_num = split_num * heads_per_split
-    dst_head_cell = elem_offsets // head_dim
-    dim_idx = elem_offsets - dst_head_cell * head_dim
+    dst_head_cell = safe_offsets // head_dim
+    dim_idx = safe_offsets - dst_head_cell * head_dim
     token_idx = dst_head_cell // head_num
     head_idx = dst_head_cell - token_idx * head_num
     split_idx = head_idx // heads_per_split
@@ -84,15 +81,10 @@ def _transpose_to_workspace_kernel(
         + head_idx_in_split * head_dim
         + dim_idx
     )
-    workspace_offsets = block_idx * block_num_stride + elem_offsets
+    workspace_offsets = block_idx * block_num_stride + safe_offsets
 
-    cache = cache.to(tl.pointer_type(tl.uint8))
-    workspace = workspace.to(tl.pointer_type(tl.uint8))
-    src_byte_offsets = src_offsets * element_size + elem_byte_offsets
-    workspace_byte_offsets = workspace_offsets * element_size + elem_byte_offsets
-
-    values = tl.load(cache + src_byte_offsets, mask=mask, other=0)
-    tl.store(workspace + workspace_byte_offsets, values, mask=mask)
+    values = tl.load(cache + src_offsets, mask=mask, other=0.0)
+    tl.store(workspace + workspace_offsets, values, mask=mask)
 
 
 @triton.jit
@@ -101,9 +93,8 @@ def _copy_workspace_back_kernel(
     block_ids,
     workspace,
     block_num_stride: tl.constexpr,
-    total_bytes: tl.constexpr,
-    element_size: tl.constexpr,
-    block_bytes: tl.constexpr,
+    total_elems: tl.constexpr,
+    block_elems: tl.constexpr,
 ):
     """
     第二阶段：把 workspace 中已经排好的最终布局写回原 cache block。
@@ -115,23 +106,16 @@ def _copy_workspace_back_kernel(
     tile_id = tl.program_id(0)
     block_idx = tl.program_id(1)
 
-    byte_offsets = tile_id * block_bytes + tl.arange(0, block_bytes)
-    mask = byte_offsets < total_bytes
-    safe_byte_offsets = tl.minimum(byte_offsets, total_bytes - 1)
-    elem_offsets = safe_byte_offsets // element_size
-    elem_byte_offsets = safe_byte_offsets - elem_offsets * element_size
+    offsets = tile_id * block_elems + tl.arange(0, block_elems)
+    mask = offsets < total_elems
+    safe_offsets = tl.minimum(offsets, total_elems - 1)
 
     block_id = tl.load(block_ids + block_idx)
-    cache_offsets = block_id * block_num_stride + elem_offsets
-    workspace_offsets = block_idx * block_num_stride + elem_offsets
+    cache_offsets = block_id * block_num_stride + safe_offsets
+    workspace_offsets = block_idx * block_num_stride + safe_offsets
 
-    cache = cache.to(tl.pointer_type(tl.uint8))
-    workspace = workspace.to(tl.pointer_type(tl.uint8))
-    cache_byte_offsets = cache_offsets * element_size + elem_byte_offsets
-    workspace_byte_offsets = workspace_offsets * element_size + elem_byte_offsets
-
-    values = tl.load(workspace + workspace_byte_offsets, mask=mask, other=0)
-    tl.store(cache + cache_byte_offsets, values, mask=mask)
+    values = tl.load(workspace + workspace_offsets, mask=mask, other=0.0)
+    tl.store(cache + cache_offsets, values, mask=mask)
 
 
 def _check_cache(
@@ -158,7 +142,7 @@ def _previous_power_of_2(value: int) -> int:
     return 1 << (value.bit_length() - 1)
 
 
-def _get_block_bytes(element_size: int) -> int:
+def _get_block_elems(element_size: int) -> int:
     # 硬件预算是 192 KiB UB，最多 40 个 program 并发共享，因此每个 program
     # 约可使用 UB_SIZE_BYTES / MAX_THREADS 字节。
     #
@@ -167,7 +151,7 @@ def _get_block_bytes(element_size: int) -> int:
     # 2048，即每个 program 4096 字节；40 个 program 总共约 160 KiB，
     # 给编译器和运行时开销留出一定余量。
     per_program_bytes = max(element_size, UB_SIZE_BYTES // MAX_THREADS)
-    return max(element_size, _previous_power_of_2(per_program_bytes))
+    return max(1, _previous_power_of_2(per_program_bytes // element_size))
 
 
 def _run_for_cache(
@@ -178,9 +162,7 @@ def _run_for_cache(
 ) -> None:
     heads_per_split, head_dim, total_elems = _check_cache(cache, block_ids, block_size, split_num)
     block_num_stride = cache.stride(0)
-    element_size = cache.element_size()
-    total_bytes = total_elems * element_size
-    block_bytes = _get_block_bytes(element_size)
+    block_elems = _get_block_elems(cache.element_size())
 
     workspace = torch.empty(
         (block_ids.numel(), block_num_stride),
@@ -188,7 +170,7 @@ def _run_for_cache(
         device=cache.device,
     )
 
-    grid = (triton.cdiv(total_bytes, block_bytes), block_ids.numel())
+    grid = (triton.cdiv(total_elems, block_elems), block_ids.numel())
     _transpose_to_workspace_kernel[grid](
         cache,
         block_ids,
@@ -198,18 +180,16 @@ def _run_for_cache(
         split_num,
         heads_per_split,
         head_dim,
-        total_bytes,
-        element_size,
-        block_bytes,
+        total_elems,
+        block_elems,
     )
     _copy_workspace_back_kernel[grid](
         cache,
         block_ids,
         workspace,
         block_num_stride,
-        total_bytes,
-        element_size,
-        block_bytes,
+        total_elems,
+        block_elems,
     )
 
 
