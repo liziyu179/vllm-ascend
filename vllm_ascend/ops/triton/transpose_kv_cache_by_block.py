@@ -17,11 +17,11 @@ def _transpose_to_workspace_kernel(
     workspace,
     block_num_stride: tl.constexpr,
     block_size: tl.constexpr,
+    head_num: tl.constexpr,
     split_num: tl.constexpr,
     heads_per_split: tl.constexpr,
     head_dim: tl.constexpr,
-    total_elems: tl.constexpr,
-    block_elems: tl.constexpr,
+    dim_block: tl.constexpr,
 ):
     """
     第一阶段：把一个 cache block 按最终布局搬到 workspace。
@@ -47,41 +47,32 @@ def _transpose_to_workspace_kernel(
     (token, head, dim)，再拆出 (split, head_in_split)，到源布局中的
     (split, token, head_in_split, dim) 位置读取。
     """
-    tile_id = tl.program_id(0)
-    block_idx = tl.program_id(1)
+    dim_tile_id = tl.program_id(0)
+    token_head_idx = tl.program_id(1)
+    block_idx = tl.program_id(2)
 
-    offsets = tile_id * block_elems + tl.arange(0, block_elems)
-    mask = offsets < total_elems
-    safe_offsets = tl.minimum(offsets, total_elems - 1)
+    dim_offsets = dim_tile_id * dim_block + tl.arange(0, dim_block)
+    mask = dim_offsets < head_dim
+    safe_dim_offsets = tl.minimum(dim_offsets, head_dim - 1)
 
     block_id = tl.load(block_ids + block_idx)
-    # 目标线性布局：
-    #   dst[token, head, dim]
-    #     = token * head_num * head_dim
-    #       + head * head_dim
-    #       + dim
-    head_num = split_num * heads_per_split
-    dst_head_cell = safe_offsets // head_dim
-    dim_idx = safe_offsets - dst_head_cell * head_dim
-    token_idx = dst_head_cell // head_num
-    head_idx = dst_head_cell - token_idx * head_num
+    token_idx = token_head_idx // head_num
+    head_idx = token_head_idx - token_idx * head_num
     split_idx = head_idx // heads_per_split
     head_idx_in_split = head_idx - split_idx * heads_per_split
 
-    # 源线性布局：
-    #   src[split, token, head_in_split, dim]
-    #     = split * block_size * heads_per_split * head_dim
-    #       + token * heads_per_split * head_dim
-    #       + head_in_split * head_dim
-    #       + dim
+    # 每个 program 只搬一个 (token, head) 的 head_dim 连续片段。
+    # 这样源和目标都是连续访存，避免在 NPU 上生成大跨度 gather。
     src_offsets = (
         block_id * block_num_stride
         + split_idx * block_size * heads_per_split * head_dim
         + token_idx * heads_per_split * head_dim
         + head_idx_in_split * head_dim
-        + dim_idx
+        + safe_dim_offsets
     )
-    workspace_offsets = block_idx * block_num_stride + safe_offsets
+    workspace_offsets = (
+        block_idx * block_num_stride + token_idx * head_num * head_dim + head_idx * head_dim + safe_dim_offsets
+    )
 
     values = tl.load(cache + src_offsets, mask=mask, other=0.0)
     tl.store(workspace + workspace_offsets, values, mask=mask)
@@ -123,7 +114,7 @@ def _check_cache(
     block_ids: torch.Tensor,
     block_size: int,
     split_num: int,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, int]:
     assert cache.is_contiguous(), "transpose_kv_cache_by_block_triton requires contiguous KV cache tensors"
     assert cache.dim() == 4, f"expected cache shape [num_blocks, block_size, head_num, head_dim], got {cache.shape}"
 
@@ -135,7 +126,7 @@ def _check_cache(
 
     heads_per_split = head_num // split_num
     total_elems = block_size * head_num * head_dim
-    return heads_per_split, head_dim, total_elems
+    return head_num, heads_per_split, head_dim, total_elems
 
 
 def _previous_power_of_2(value: int) -> int:
@@ -154,15 +145,21 @@ def _get_block_elems(element_size: int) -> int:
     return max(1, _previous_power_of_2(per_program_bytes // element_size))
 
 
+def _get_dim_block(head_dim: int, element_size: int) -> int:
+    return min(head_dim, _get_block_elems(element_size))
+
+
 def _run_for_cache(
     cache: torch.Tensor,
     block_ids: torch.Tensor,
     block_size: int,
     split_num: int,
 ) -> None:
-    heads_per_split, head_dim, total_elems = _check_cache(cache, block_ids, block_size, split_num)
+    head_num, heads_per_split, head_dim, total_elems = _check_cache(cache, block_ids, block_size, split_num)
     block_num_stride = cache.stride(0)
-    block_elems = _get_block_elems(cache.element_size())
+    element_size = cache.element_size()
+    block_elems = _get_block_elems(element_size)
+    dim_block = _get_dim_block(head_dim, element_size)
 
     workspace = torch.empty(
         (block_ids.numel(), block_num_stride),
@@ -170,20 +167,26 @@ def _run_for_cache(
         device=cache.device,
     )
 
-    grid = (triton.cdiv(total_elems, block_elems), block_ids.numel())
-    _transpose_to_workspace_kernel[grid](
+    transpose_grid = (
+        triton.cdiv(head_dim, dim_block),
+        block_size * head_num,
+        block_ids.numel(),
+    )
+    _transpose_to_workspace_kernel[transpose_grid](
         cache,
         block_ids,
         workspace,
         block_num_stride,
         block_size,
+        head_num,
         split_num,
         heads_per_split,
         head_dim,
-        total_elems,
-        block_elems,
+        dim_block,
     )
-    _copy_workspace_back_kernel[grid](
+
+    copy_grid = (triton.cdiv(total_elems, block_elems), block_ids.numel())
+    _copy_workspace_back_kernel[copy_grid](
         cache,
         block_ids,
         workspace,
