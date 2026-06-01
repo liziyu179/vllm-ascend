@@ -44,22 +44,19 @@ def _transpose_block_inplace_kernel(
 
         src_desc = tl.make_tensor_descriptor(
             cache + block_base,
-            shape=[split_num * block_size, group_elems],
-            strides=[group_elems, 1],
-            block_shape=[split_num * block_size, group_elems],
+            shape=[block_size, split_num, group_elems],
+            strides=[group_elems, block_size * group_elems, 1],
+            block_shape=[block_size, split_num, group_elems],
         )
         dst_desc = tl.make_tensor_descriptor(
             cache + block_base,
-            shape=[block_size * split_num, group_elems],
-            strides=[group_elems, 1],
-            block_shape=[block_size * split_num, group_elems],
+            shape=[block_size, split_num, group_elems],
+            strides=[split_num * group_elems, group_elems, 1],
+            block_shape=[block_size, split_num, group_elems],
         )
 
-        values = src_desc.load([0, 0])
-        values = values.reshape(split_num, block_size, group_elems)
-        values = tl.permute(values, (1, 0, 2))
-        values = values.reshape(block_size * split_num, group_elems)
-        dst_desc.store([0, 0], values)
+        values = src_desc.load([0, 0, 0])
+        dst_desc.store([0, 0, 0], values)
 
         selected_block_idx += selected_block_stride
 
