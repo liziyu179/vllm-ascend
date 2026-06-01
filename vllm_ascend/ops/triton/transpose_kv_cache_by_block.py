@@ -16,12 +16,9 @@ def _transpose_block_inplace_kernel(
     cache_ptrs,
     block_ids,
     block_stride: tl.constexpr,
-    elems_per_block: tl.constexpr,
     block_size: tl.constexpr,
-    head_num: tl.constexpr,
-    heads_per_split: tl.constexpr,
-    head_dim: tl.constexpr,
-    vector_elems: tl.constexpr,
+    split_num: tl.constexpr,
+    group_elems: tl.constexpr,
     selected_block_count: tl.constexpr,
 ):
     """
@@ -42,29 +39,27 @@ def _transpose_block_inplace_kernel(
     cache = tl.load(cache_ptrs + cache_idx).to(tl.pointer_type(tl.uint16))
 
     while selected_block_idx < selected_block_count:
-        offsets = tl.arange(0, vector_elems)
-        mask = offsets < elems_per_block
-        safe_offsets = tl.minimum(offsets, elems_per_block - 1)
-
-        dim_idx = safe_offsets % head_dim
-        head_token_idx = safe_offsets // head_dim
-        head_idx = head_token_idx % head_num
-        token_idx = head_token_idx // head_num
-        split_idx = head_idx // heads_per_split
-        head_idx_in_split = head_idx - split_idx * heads_per_split
-
-        src_offsets = (
-            split_idx * block_size * heads_per_split * head_dim
-            + token_idx * heads_per_split * head_dim
-            + head_idx_in_split * head_dim
-            + dim_idx
-        )
-
         cache_block_id = tl.load(block_ids + selected_block_idx).to(tl.int64)
         block_base = cache_block_id * block_stride
 
-        values = tl.load(cache + block_base + src_offsets, mask=mask, other=0)
-        tl.store(cache + block_base + safe_offsets, values, mask=mask)
+        src_desc = tl.make_tensor_descriptor(
+            cache + block_base,
+            shape=[split_num * block_size, group_elems],
+            strides=[group_elems, 1],
+            block_shape=[split_num * block_size, group_elems],
+        )
+        dst_desc = tl.make_tensor_descriptor(
+            cache + block_base,
+            shape=[block_size * split_num, group_elems],
+            strides=[group_elems, 1],
+            block_shape=[block_size * split_num, group_elems],
+        )
+
+        values = src_desc.load([0, 0])
+        values = values.reshape(split_num, block_size, group_elems)
+        values = tl.permute(values, (1, 0, 2))
+        values = values.reshape(block_size * split_num, group_elems)
+        dst_desc.store([0, 0], values)
 
         selected_block_idx += selected_block_stride
 
@@ -143,7 +138,7 @@ def _run_for_caches(
 
     block_stride = caches[0].stride(0)
     selected_block_count = block_ids.numel()
-    vector_elems = triton.next_power_of_2(elems_per_block)
+    group_elems = heads_per_split * head_dim
     cache_ptrs = torch.tensor([cache.data_ptr() for cache in caches], dtype=torch.int64, device=caches[0].device)
 
     grid = (min(selected_block_count, MAX_PROGRAMS), len(caches))
@@ -151,12 +146,9 @@ def _run_for_caches(
         cache_ptrs,
         block_ids,
         block_stride,
-        elems_per_block,
         block_size,
-        head_num,
-        heads_per_split,
-        head_dim,
-        vector_elems,
+        split_num,
+        group_elems,
         selected_block_count,
     )
 
