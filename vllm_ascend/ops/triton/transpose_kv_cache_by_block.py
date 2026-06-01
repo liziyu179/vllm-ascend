@@ -4,10 +4,10 @@
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-# Keep the per-program vector bounded for Ascend vector-core UB usage. The
+# Keep the per-program tensor bounded for Ascend vector-core UB usage. The
 # no-workspace implementation needs one program to own a full cache block to
 # avoid in-place overwrite hazards across programs.
-MAX_FULL_BLOCK_ELEMS = 131072
+MAX_PROGRAM_BYTES = 192 * 1024
 MAX_PROGRAMS = 40
 
 
@@ -118,11 +118,12 @@ def _check_caches(
             elems_per_block,
         )
 
-    if elems_per_block > MAX_FULL_BLOCK_ELEMS:
+    if elems_per_block * caches[0].element_size() > MAX_PROGRAM_BYTES:
         raise ValueError(
             "transpose_kv_cache_by_block_triton no-workspace path requires "
-            f"elems_per_block <= {MAX_FULL_BLOCK_ELEMS}, got {elems_per_block}. "
-            "Splitting a block across programs would need a workspace or a global barrier to avoid in-place overwrite."
+            f"one full cache block <= {MAX_PROGRAM_BYTES} bytes, got "
+            f"{elems_per_block * caches[0].element_size()} bytes. Splitting a block across programs would need "
+            "a workspace or a global barrier to avoid in-place overwrite."
         )
 
     return head_num, heads_per_split, head_dim, elems_per_block
