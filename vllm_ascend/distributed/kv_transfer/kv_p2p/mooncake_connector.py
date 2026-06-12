@@ -562,10 +562,10 @@ class KVCacheRecvingThread(threading.Thread):
         with self.failed_recv_requests_lock:
             return request_id in self.failed_recv_requests
 
-    def _mark_failed_recv_request(self, request_id: str, local_block_ids: list[int]) -> None:
+    def _mark_failed_recv_request(self, request_id: str, local_block_ids: BlockIds) -> None:
         with self.failed_recv_requests_lock:
             self.failed_recv_requests.add(request_id)
-            self.invalid_block_ids.update(local_block_ids)
+            self.invalid_block_ids.update(local_block_ids[0])
 
     def _clear_failed_recv_request(self, request_id: str) -> None:
         with self.failed_recv_requests_lock:
