@@ -3571,7 +3571,35 @@ class NPUModelRunner(GPUModelRunner):
             if self.use_compress and force_attention:
                 self.positions.fill_(0)
                 self._dsa_positions_cpu_buf.fill_(0)
+            if is_profile or is_graph_capturing:
+                self._clear_gdn_dummy_kv_cache()
             return hidden_states, hidden_states
+
+    def _clear_gdn_dummy_kv_cache(self) -> None:
+        """Clear GDN conv/state cache dirtied by profile/capture dummy runs.
+
+        Dummy runs do not own real cache slots. Attention KV writes are skipped
+        via slot_mapping=-1, but GDN/Mamba-style conv state is indexed from the
+        block table. Clear those state tensors after dummy execution so the
+        first real decode request cannot observe dummy state.
+        """
+
+        def clear_model(model: torch.nn.Module | None) -> None:
+            if model is None:
+                return
+            for module in model.modules():
+                if not hasattr(module, "conv1d") or not hasattr(module, "kv_cache"):
+                    continue
+                kv_cache = getattr(module, "kv_cache", None)
+                if not isinstance(kv_cache, (tuple, list)):
+                    continue
+                for cache in kv_cache:
+                    if isinstance(cache, torch.Tensor):
+                        cache.zero_()
+
+        clear_model(getattr(self, "model", None))
+        drafter = getattr(self, "drafter", None)
+        clear_model(getattr(drafter, "model", None))
 
     @torch.inference_mode()
     def _dummy_sampler_run(
