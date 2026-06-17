@@ -96,6 +96,20 @@ def get_spec_causal_conv1d_update_host_args(attn_metadata) -> tuple[tuple[int, .
     )
 
 
+def is_dummy_graph_capture() -> bool:
+    forward_context = get_forward_context()
+    return bool(
+        getattr(forward_context, "is_dummy_run", False)
+        and getattr(forward_context, "capturing", False)
+    )
+
+
+def maybe_pad_cache_indices_for_dummy_graph_capture(cache_indices: tuple[int, ...]) -> tuple[int, ...]:
+    if not is_dummy_graph_capture():
+        return cache_indices
+    return (PAD_SLOT_ID,) * len(cache_indices)
+
+
 def _pad_conv1d_host_args_to_capture(
     qsl_host: tuple[int, ...],
     cidx_host: tuple[int, ...],
@@ -426,6 +440,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             conv_weights_T = conv_weights.transpose(0, 1)
             activation_num = 1 if self.activation else 0
             (spec_qsl_host, spec_ci_host, spec_nat_host) = get_spec_causal_conv1d_update_host_args(attn_metadata)
+            op_spec_ci_host = maybe_pad_cache_indices_for_dummy_graph_capture(spec_ci_host)
             # capturing branch for conv1d update
             if _EXTRA_CTX.capturing:
                 stream = torch_npu.npu.current_stream()
@@ -455,7 +470,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         "spec",
                         self.prefix,
                         spec_qsl_host,
-                        spec_ci_host,
+                        op_spec_ci_host,
                         spec_nat_host,
                         spec_q_per_seq,
                     )
@@ -469,7 +484,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     conv_state=self_kv_cache[0],
                     bias_opt=self.conv1d.bias,
                     query_start_loc_opt=spec_qsl_host,
-                    cache_indices_opt=spec_ci_host,
+                    cache_indices_opt=op_spec_ci_host,
                     initial_state_mode_opt=(),
                     num_accepted_tokens_opt=spec_nat_host,
                     activation_mode=activation_num,
@@ -489,7 +504,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     conv_state=self_kv_cache[0],
                     bias_opt=self.conv1d.bias,
                     query_start_loc_opt=spec_qsl_host,
-                    cache_indices_opt=spec_ci_host,
+                    cache_indices_opt=op_spec_ci_host,
                     initial_state_mode_opt=(),
                     num_accepted_tokens_opt=spec_nat_host,
                     activation_mode=activation_num,
@@ -525,6 +540,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         cache_indices_opt,
                         initial_state_mode_opt,
                     ) = get_non_spec_causal_conv1d_host_args(attn_metadata)
+                    op_cache_indices_opt = maybe_pad_cache_indices_for_dummy_graph_capture(cache_indices_opt)
                     mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
                     torch.ops._C_ascend.npu_causal_conv1d_custom(
                         mixed_qkv_non_spec_output,
@@ -533,7 +549,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         conv_state=self_kv_cache[0],
                         bias_opt=self.conv1d.bias,
                         query_start_loc_opt=query_start_loc_opt,
-                        cache_indices_opt=cache_indices_opt,
+                        cache_indices_opt=op_cache_indices_opt,
                         initial_state_mode_opt=initial_state_mode_opt,
                         num_accepted_tokens_opt=[],
                         activation_mode=activation_num,
@@ -545,6 +561,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             conv_weights_T = conv_weights.transpose(0, 1)
             activation_num = 1 if self.activation else 0
             non_spec_qsl_host, non_spec_ci_host = get_causal_conv1d_update_host_args(attn_metadata)
+            op_non_spec_ci_host = maybe_pad_cache_indices_for_dummy_graph_capture(non_spec_ci_host)
             # graph capture branch
             if _EXTRA_CTX.capturing:
                 stream = torch_npu.npu.current_stream()
@@ -571,7 +588,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         "non_spec_decode",
                         self.prefix,
                         non_spec_qsl_host,
-                        non_spec_ci_host,
+                        op_non_spec_ci_host,
                         [],
                         non_spec_q_per_seq,
                     )
@@ -585,7 +602,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     conv_state=self_kv_cache[0],
                     bias_opt=self.conv1d.bias,
                     query_start_loc_opt=non_spec_qsl_host,
-                    cache_indices_opt=non_spec_ci_host,
+                    cache_indices_opt=op_non_spec_ci_host,
                     initial_state_mode_opt=(),
                     num_accepted_tokens_opt=[],
                     activation_mode=activation_num,

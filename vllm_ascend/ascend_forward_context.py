@@ -70,6 +70,7 @@ def set_ascend_forward_context(
     draft_attn_metadatas=None,
     has_sinks=False,
     input_ids=None,
+    is_dummy_run: bool = False,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -101,6 +102,7 @@ def set_ascend_forward_context(
         tp_world_size = get_tensor_model_parallel_world_size()
 
         forward_context.in_profile_run = in_profile_run
+        forward_context.is_dummy_run = is_dummy_run
 
         # NOTE: This cannot be set using set_forward_context
         # due to multiple warmups before actual capturing
@@ -344,6 +346,7 @@ class _ExtraForwardContextProxy:
         "max_tokens_across_pcp",
         "num_accept_tokens",
         "in_profile_run",
+        "is_dummy_run",
         "padded_num_tokens",
         "sinks",
     )
