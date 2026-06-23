@@ -1,12 +1,7 @@
-def _host_tuple_to_tensor(
-    values: tuple[int, ...] | list[int],
-    *,
-    device: torch.device,
-    dtype: torch.dtype = torch.long,
-) -> torch.Tensor | None:
+def _host_tuple_or_none(values: tuple[int, ...] | list[int]) -> tuple[int, ...] | None:
     if len(values) == 0:
         return None
-    return torch.tensor(values, device=device, dtype=dtype)
+    return tuple(int(v) for v in values)
 
 
 def _causal_conv1d_custom_torch(
@@ -45,42 +40,43 @@ def _causal_conv1d_custom_torch(
     width = weight_for_conv.shape[1]
     state_len = width - 1
     activation = "silu" if activation_mode else None
-    query_start_loc = _host_tuple_to_tensor(query_start_loc_opt, device=x.device)
-    cache_indices = _host_tuple_to_tensor(cache_indices_opt, device=x.device)
-    has_initial_state = _host_tuple_to_tensor(initial_state_mode_opt, device=x.device, dtype=torch.bool)
-    num_accepted_tokens = _host_tuple_to_tensor(num_accepted_tokens_opt, device=x.device)
+    query_start_loc = _host_tuple_or_none(query_start_loc_opt)
+    cache_indices = _host_tuple_or_none(cache_indices_opt)
+    has_initial_state = _host_tuple_or_none(initial_state_mode_opt)
+    num_accepted_tokens = _host_tuple_or_none(num_accepted_tokens_opt)
 
     if query_start_loc is None or cache_indices is None:
         raise RuntimeError("causal_conv1d_custom torch fallback requires query_start_loc_opt and cache_indices_opt.")
 
-    seqlens = (query_start_loc[1:] - query_start_loc[:-1]).tolist()
+    seqlens = [end - start for start, end in zip(query_start_loc[:-1], query_start_loc[1:])]
     max_query_len = max(seqlens, default=0)
     output.zero_()
 
     def _conv(seq_tokens: torch.Tensor, initial_state: torch.Tensor | None) -> torch.Tensor:
         conv_x = seq_tokens.transpose(0, 1).unsqueeze(0).to(weight_for_conv.dtype)
+        bias = bias_opt.to(weight_for_conv.dtype) if bias_opt is not None else None
         if initial_state is None:
-            conv_out = F.conv1d(conv_x, weight_for_conv.unsqueeze(1), bias_opt, padding=state_len, groups=dim)
+            conv_out = F.conv1d(conv_x, weight_for_conv.unsqueeze(1), bias, padding=state_len, groups=dim)
         else:
             conv_x = torch.cat([initial_state.to(weight_for_conv.dtype), conv_x], dim=-1)
-            conv_out = F.conv1d(conv_x, weight_for_conv.unsqueeze(1), bias_opt, padding=0, groups=dim)
+            conv_out = F.conv1d(conv_x, weight_for_conv.unsqueeze(1), bias, padding=0, groups=dim)
         conv_out = conv_out[..., : seq_tokens.shape[0]]
         if activation in ("silu", "swish"):
             conv_out = F.silu(conv_out)
         return conv_out.squeeze(0).transpose(0, 1).to(output.dtype)
 
     for i, seq_len in enumerate(seqlens):
-        cache_idx = int(cache_indices[i].item())
+        cache_idx = cache_indices[i]
         if cache_idx == pad_slot_id or seq_len <= 0:
             continue
 
-        start = int(query_start_loc[i].item())
+        start = query_start_loc[i]
         end = start + int(seq_len)
         seq_tokens = x[start:end]
         state = conv_state[cache_idx]
 
         if run_mode == 0:
-            use_initial_state = has_initial_state is not None and bool(has_initial_state[i].item())
+            use_initial_state = has_initial_state is not None and bool(has_initial_state[i])
             initial_state = state[:state_len].transpose(0, 1).unsqueeze(0) if use_initial_state else None
             output[start:end].copy_(_conv(seq_tokens, initial_state))
 
@@ -100,7 +96,7 @@ def _causal_conv1d_custom_torch(
             effective_state_len = state_len
             shift = seq_len
         else:
-            state_offset = int(num_accepted_tokens[i].item()) - 1
+            state_offset = num_accepted_tokens[i] - 1
             effective_state_len = state_len + max_query_len - 1 - (max_query_len - seq_len)
             shift = 1
 
