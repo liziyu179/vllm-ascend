@@ -108,6 +108,17 @@ On Ascend, the current attention backend support levels are:
 
 This is why the effective graph mode on Ascend may differ from the mode requested in configuration.
 
+### Troubleshooting capture resource exhaustion
+
+If ACLGraph capture fails because the configured graph sizes exceed the runtime resources available on the current stack, vLLM Ascend now raises a dedicated error with mitigation guidance. In practice, the most useful actions are:
+
+- upgrade to a newer HDK/CANN stack if one is available;
+- reduce `cudagraph_capture_sizes` or `max_cudagraph_capture_size`;
+- prefer `FULL` or `FULL_DECODE_ONLY` when the workload is mostly uniform decode;
+- temporarily disable graph mode to confirm the issue is capture-related.
+
+This is most likely to appear in `PIECEWISE` or `FULL_AND_PIECEWISE` configurations because those paths tend to capture more graphs than uniform full-graph decode.
+
 ## Using Npugraph_ex
 
 As introduced in the [RFC](https://github.com/vllm-project/vllm-ascend/issues/4715), Npugraph_ex is a compile-time FX graph optimization layer that works together with ACLGraph. It optimizes the model's FX graph before ACLGraph captures it at runtime. Its performance benefits mainly come from fusing multiple operators into single kernels (e.g., add + rms_norm → npu_add_rms_norm) to reduce kernel launch overhead.
@@ -164,9 +175,9 @@ vllm serve Qwen/Qwen2-7B-Instruct \
 
 Static kernel compilation is an **optional** feature that pre-compiles operator binaries with fixed shapes at compile time, reducing runtime overhead for networks with static or near-static shapes. It is **disabled by default** and must be explicitly enabled.
 
-```{note}
-Enabling static kernel triggers a compilation pass during the graph capture phase at service startup. This may add **several minutes to tens of minutes** to the startup time depending on the number of operators to compile and model complexity. Once completed, subsequent request processing is not affected.
-```
+!!! note
+
+    Enabling static kernel triggers a compilation pass during the graph capture phase at service startup. This may add **several minutes to tens of minutes** to the startup time depending on the number of operators to compile and model complexity. Once completed, subsequent request processing is not affected.
 
 Offline example:
 
@@ -259,6 +270,8 @@ For more details about Xlite, see the [Xlite README](https://atomgit.com/openeul
 ## Fallback to Eager Mode
 
 If you encounter issues with graph mode, you can temporarily fall back to eager mode by setting `enforce_eager=True`.
+
+If ACL graph capture fails with the confirmed stream-resource signature in the error text, such as `207008` together with `Stream resources are insufficient` or `Insufficient_Stream_Resources`, vLLM Ascend will re-raise that capture failure with targeted mitigation guidance. In practice, the main levers are: upgrading to a newer HDK/CANN stack, reducing `cudagraph_capture_sizes`, lowering `max_cudagraph_capture_size`, or preferring `FULL` / `FULL_DECODE_ONLY` when the workload is mostly uniform decode.
 
 **Offline example:**
 

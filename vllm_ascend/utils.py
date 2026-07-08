@@ -123,6 +123,32 @@ def is_310p():
     return get_ascend_device_type() == AscendDeviceType._310P
 
 
+_IS_RC_DEVICE: bool | None = None
+
+
+def is_rc_device() -> bool:
+    """Return True if the 310P NPU runs in Root Complex (RC) mode.
+
+    RC mode (e.g. Atlas 200I Pro): host and NPU share memory. EP mode
+    (e.g. Atlas 300I DUO on PCIe): ``lspci`` output typically contains
+    ``accelerators``.
+    """
+    global _IS_RC_DEVICE
+    if not is_310p():
+        return False
+    if _IS_RC_DEVICE is not None:
+        return _IS_RC_DEVICE
+
+    try:
+        import subprocess
+
+        result = subprocess.run(["lspci"], capture_output=True, text=True, check=True)
+        _IS_RC_DEVICE = not any("accelerators" in line.strip() for line in result.stdout.splitlines())
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        _IS_RC_DEVICE = False
+    return _IS_RC_DEVICE
+
+
 def is_950():
     return get_ascend_device_type() == AscendDeviceType.A5
 
@@ -211,6 +237,10 @@ def _should_trans_nz(weight: torch.Tensor) -> bool:
     if weight.dtype == torch.float32:
         return False
 
+    # meta tensor only keeps shape/dtype meta info without physical memory, it is not necessary to trans it to NZ
+    if weight.is_meta:
+        return False
+
     # 310P always converts to NZ.
     if is_310p():
         return True
@@ -235,6 +265,7 @@ def _should_trans_nz(weight: torch.Tensor) -> bool:
 # - 310P: always convert supported weights to FRACTAL_NZ
 # - non-310P: follow VLLM_ASCEND_ENABLE_NZ
 # - FP32: never convert
+# - meta tensor: never convert
 def maybe_trans_nz(weight: torch.Tensor) -> torch.Tensor:
     if not _should_trans_nz(weight):
         return weight
@@ -394,10 +425,20 @@ def enable_custom_op():
                 _CUSTOM_OP_ENABLED = True
             except ImportError:
                 _CUSTOM_OP_ENABLED = False
-                logger.warning("Warning: Failed to register custom ops, all custom ops will be disabled")
+                logger.warning(
+                    "Failed to register custom ops, all custom ops will be disabled. "
+                    "The custom ops library might not be installed or the environment is not configured correctly. "
+                    "Please check the custom ops installation and environment variables."
+                )
         else:
             _CUSTOM_OP_ENABLED = False
-            logger.warning("Warning: Failed to register custom ops, all custom ops will be disabled")
+            logger.warning(
+                "Failed to register custom ops, all custom ops will be disabled. "
+                "error=%s. "
+                "The custom ops library might not be installed or the environment is not configured correctly. "
+                "Please check the custom ops installation and environment variables.",
+                e,
+            )
     return _CUSTOM_OP_ENABLED
 
 
@@ -591,7 +632,11 @@ def update_cudagraph_capture_sizes(vllm_config: VllmConfig, cudagraph_capture_si
                 f"cudagraph_capture_sizes(={valid_max_size})"
             )
         logger.warning(
-            "Truncating max_cudagraph_capture_size to %d",
+            "Truncating max_cudagraph_capture_size. "
+            "original_size=%d, truncated_size=%d. "
+            "The max_cudagraph_capture_size does not match the max value of cudagraph_capture_sizes. "
+            "Please check the compilation_config for consistency.",
+            vllm_config.compilation_config.max_cudagraph_capture_size,
             valid_max_size,
         )
 
@@ -601,155 +646,14 @@ def update_cudagraph_capture_sizes(vllm_config: VllmConfig, cudagraph_capture_si
         vllm_config.compilation_config.cudagraph_capture_sizes
     ):
         logger.warning(
-            ("cudagraph_capture_sizes specified in compilation_config %s is overridden by config %s"),
+            "cudagraph_capture_sizes specified in compilation_config is overridden. "
+            "compilation_config_sizes=%s, overridden_sizes=%s. "
+            "The sizes are adjusted based on model configuration and resource constraints.",
             vllm_config.compilation_config.cudagraph_capture_sizes,
             cudagraph_capture_sizes,
         )
     vllm_config.compilation_config.cudagraph_capture_sizes = cudagraph_capture_sizes
     vllm_config.compilation_config.post_init_cudagraph_sizes()
-
-
-def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
-    """Update ACL graph capture sizes based on hardware limitations"""
-    # NOTE: Currently, we can only capture 1800 graphs at most,
-    # due to the limitation of ACL graph. This number is bounded by
-    # the number of streams, which is 2048, we save 248 streams
-    # as a buffer.
-    # Maximum number of graphs that can be captured by ACL Graph
-    MAX_CAPTURE_SIZE = 1800
-
-    # enable pcp or dcp will add new communication and consume additional approximately less than 100 streams
-    CP_ADDITIONAL_STREAM_NUM = 100
-
-    # Store original configuration and temporarily clear it
-    compilation_config = vllm_config.compilation_config
-    original_sizes, compilation_config.cudagraph_capture_sizes = compilation_config.cudagraph_capture_sizes, None
-
-    # TODO: Find out if we can have different sizes for mixed batch and uniform batch
-    # If so, we'll only have to reduce the sizes for mixed batch
-    from vllm.config.compilation import CUDAGraphMode
-
-    cudagraph_mode = compilation_config.cudagraph_mode
-    if cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE:
-        MAX_CAPTURE_SIZE = max(0, MAX_CAPTURE_SIZE - len(original_sizes))
-
-    # Calculate parallel configuration factor
-    if not vllm_config.model_config:
-        logger.warning(
-            "Got empty model config. This typically occurs when an empty vllm_config is "
-            "initialized (e.g., in unit tests), where config updates are intentionally skipped."
-        )
-
-        return
-
-    hf_config = vllm_config.model_config.hf_text_config
-    if hasattr(hf_config, "num_hidden_layers"):
-        num_hidden_layers = hf_config.num_hidden_layers
-    else:
-        num_hidden_layers = get_max_hidden_layers(hf_config)
-    parallel_config = vllm_config.parallel_config
-
-    # Calculate maximum supported batch sizes considering model architecture
-    resources_per_graph = num_hidden_layers + 1
-    # For suffix decoding, use the suffix path when no draft_model_config is provided.
-    if (spec := vllm_config.speculative_config) and (draft := spec.draft_model_config):
-        # Use get_total_num_hidden_layers() to correctly handle MTP models,
-        # which store layer count in num_nextn_predict_layers or
-        # mtp_num_hidden_layers (for Qwen3.5) instead of num_hidden_layers.
-        resources_per_graph += draft.get_total_num_hidden_layers() + 1
-
-    # TODO: Find out whether we need to take into account the pp_size
-    num_comm_groups = sum(
-        size > 1
-        for size in [
-            parallel_config.data_parallel_size,
-            parallel_config.tensor_parallel_size,
-        ]
-    )
-
-    if os.getenv("HCCL_OP_EXPANSION_MODE") == "AIV":
-        # TODO: Find out whether we need to take into account the pp_size
-        parallel_factor = (
-            1
-            + num_comm_groups
-            + int(parallel_config.enable_expert_parallel)
-            + int(vllm_config.additional_config.get("multistream_overlap_shared_expert", False))
-        )
-        if is_moe_model(vllm_config):
-            parallel_factor += parallel_config.data_parallel_size > 1
-        else:
-            # When AIV mode is enabled, the allreduce operator of the dense
-            # layer model will occupy additional streams, which are buffered here.
-            MAX_CAPTURE_SIZE = MAX_CAPTURE_SIZE - parallel_factor * resources_per_graph
-
-        # Calculate maximum supported batch sizes considering model architecture on the A2 Hardware Device
-        # Assume the following case:
-        # MAX_CAPTURE_SIZE = 1920, num_hidden_layers = 48, data_parallel_size is 1, tensor_parallel_size is 4,
-        # According to the formula, max_num_batch_sizes = math.floor(1920 / (48 + 1) / 2) = 19
-        max_num_batch_sizes = math.floor(MAX_CAPTURE_SIZE / resources_per_graph / parallel_factor)
-        logger.info("Calculated maximum supported batch sizes for ACL graph: %s", max_num_batch_sizes)
-    else:
-        # enable pcp or dcp will add new communication and consume additional approximately less than 100 streams
-        if parallel_config.prefill_context_parallel_size > 1:
-            MAX_CAPTURE_SIZE = MAX_CAPTURE_SIZE - CP_ADDITIONAL_STREAM_NUM
-        if parallel_config.decode_context_parallel_size > 1:
-            MAX_CAPTURE_SIZE = MAX_CAPTURE_SIZE - CP_ADDITIONAL_STREAM_NUM
-
-        # The above describes an empirical formula applicable to the A2 hardware.
-        # Under this configuration, HCCL employs the FFTS+ method for execution unfolding,
-        # which adds only 1 concurrent stream without consuming collective communication execution unfolding streams.
-        # On A3 hardware, HCCL defaults to the AICPU method.
-        # This approach may additionally allocate up to rank_size (max 16) - 1 streams per collective communication
-        # domain on the device (worst case).
-        # Using the default collective communication unfolding method on A3 will lead to a significant reduction
-        # in the maximum supported sizes.
-        # Therefore, the calculation formula has been modified as follows:
-        # Assume the following case:
-        # MAX_CAPTURE_SIZE = 1920, num_hidden_layers = 48, data_parallel_size is 1, tensor_parallel_size is 4,
-        # According to the formula, max_num_batch_sizes = math.floor((1920 - 1 * 40) / (48 + 1) / (1 + 1 * 2)) = 12
-        max_num_batch_sizes = math.floor(
-            (MAX_CAPTURE_SIZE - num_comm_groups * 40) / resources_per_graph / (1 + num_comm_groups * 2)
-        )
-        logger.info("Calculated maximum supported batch sizes for ACL graph: %s", max_num_batch_sizes)
-        logger.warning(
-            "Currently, communication is performed using FFTS+ method, which reduces "
-            "the number of available streams and, as a result, limits the range of runtime "
-            "shapes that can be handled. To both improve communication performance and "
-            "increase the number of supported shapes, set HCCL_OP_EXPANSION_MODE=AIV."
-        )
-
-    arch_name = vllm_config.model_config.architecture
-
-    # If original sizes exceed maximum, sample a representative subset
-    if max_num_batch_sizes < len(original_sizes):
-        # Sample uniformly from original sizes
-        if max_num_batch_sizes <= 1:
-            # Avoid division by zero when only one capture size can be kept.
-            sampled_sizes = [original_sizes[-1]]
-        else:
-            step = (len(original_sizes) - 1) / (max_num_batch_sizes - 1)
-            indices = [round(i * step) for i in range(max_num_batch_sizes)]
-            indices[0], indices[-1] = 0, len(original_sizes) - 1
-            sampled_sizes = [original_sizes[i] for i in indices]
-        update_cudagraph_capture_sizes(vllm_config, sampled_sizes)
-        logger.info(
-            "Adjusted ACL graph batch sizes for %s model (layers: %d): %d → %d sizes",
-            arch_name,
-            num_hidden_layers,
-            len(original_sizes),
-            len(
-                compilation_config.cudagraph_capture_sizes  # type: ignore[arg-type]
-            ),
-        )
-    else:
-        # No adjustment needed
-        compilation_config.cudagraph_capture_sizes = original_sizes
-        logger.info(
-            "No adjustment needed for ACL graph batch sizes: %s model (layers: %d) with %d sizes",
-            arch_name,
-            num_hidden_layers,
-            len(original_sizes),
-        )
 
 
 # TODO(wxy): Move to ops module
@@ -775,7 +679,6 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     )
     from vllm_ascend.ops.bailing_moe_linear_attn import AscendBailingMoELinearAttention
     from vllm_ascend.ops.conv import AscendConv3dLayer
-    from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE
     from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
     from vllm_ascend.ops.layernorm import AscendGemmaRMSNorm, AscendRMSNorm, AscendRMSNormGated
     from vllm_ascend.ops.linear import (
@@ -821,7 +724,6 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "LogitsProcessor": AscendLogitsProcessor,
         "RMSNorm": AscendRMSNorm,
         "GemmaRMSNorm": AscendGemmaRMSNorm,
-        "FusedMoE": AscendFusedMoE,
         "MultiHeadLatentAttentionWrapper": AscendMultiHeadLatentAttention,
         "MMEncoderAttention": AscendMMEncoderAttention,
         "ApplyRotaryEmb": AscendApplyRotaryEmb,
@@ -832,6 +734,10 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "GatedDeltaNetAttention": AscendGatedDeltaNetAttention,
         "BailingMoELinearAttention": AscendBailingMoELinearAttention,
     }
+    if vllm_version_is("0.23.0"):
+        from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE
+
+        REGISTERED_ASCEND_OPS["FusedMoE"] = AscendFusedMoE
 
     if vllm_config is None:
         try:
@@ -847,7 +753,6 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
 
     # 310P: override selected ops with 310P implementations (keep minimal changes outside _310p)
     if is_310p():
-        from vllm_ascend._310p.fused_moe.fused_moe import AscendFusedMoE310
         from vllm_ascend._310p.ops.activation import AscendSiluAndMul310
         from vllm_ascend._310p.ops.conv import AscendConv3dLayer310
         from vllm_ascend._310p.ops.fla.gdn_310 import AscendGatedDeltaNetAttention310
@@ -870,7 +775,6 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
                 "RMSNorm": AscendRMSNorm310,
                 "GemmaRMSNorm": AscendGemmaRMSNorm310,
                 "RMSNormGated": AscendRMSNormGated310,
-                "FusedMoE": AscendFusedMoE310,
                 "ParallelLMHead": AscendParallelLMHead310,
                 "VocabParallelEmbedding": AscendVocabParallelEmbedding310,
                 "MMEncoderAttention": AscendMMEncoderAttention310,
@@ -879,6 +783,10 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
                 "MRotaryEmbedding": AscendMRotaryEmbedding310,
             }
         )
+        if vllm_version_is("0.23.0"):
+            from vllm_ascend._310p.fused_moe.fused_moe import AscendFusedMoE310
+
+            REGISTERED_ASCEND_OPS["FusedMoE"] = AscendFusedMoE310
 
     for name, op_cls in REGISTERED_ASCEND_OPS.items():
         CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)
@@ -990,7 +898,7 @@ def enable_sp(vllm_config=None, enable_shared_expert_dp: bool = False) -> bool:
 
         if not _ENABLE_SP and enable_shared_expert_dp:
             _ENABLE_SP = True
-            logger.info("shared_expert_dp requires enable_sp = True. has set enable_sp to True")
+            logger.info("shared_expert_dp requires enable_sp=True. enable_sp has been set to True.")
 
     return bool(_ENABLE_SP)
 
@@ -1013,8 +921,21 @@ def is_drafter_moe_model(vllm_config: VllmConfig):
     """Checks if the drafter model is a MoE model by config"""
     global _IS_DRAFTER_MOE_MODEL
     if _IS_DRAFTER_MOE_MODEL is None:
-        model_configs = vllm_config.speculative_config.draft_model_config.hf_text_config.to_dict()
+        speculative_config = vllm_config.speculative_config
+        if speculative_config.method == "extract_hidden_states":
+            # The extract_hidden_states drafter is a cache-only attention layer
+            # (never MoE), but its hf_config is copied from the possibly-MoE
+            # target, so the expert-key scan below would misclassify it. Skip
+            # the scan to keep the drafter DP sync free of a spurious
+            # all_reduce that idle DP ranks never match.
+            _IS_DRAFTER_MOE_MODEL = False
+            return _IS_DRAFTER_MOE_MODEL
+        model_configs = speculative_config.draft_model_config.hf_text_config.to_dict()
         _IS_DRAFTER_MOE_MODEL = _is_contain_expert(model_configs)
+        if not model_configs or not model_configs.get("architectures"):
+            return _IS_DRAFTER_MOE_MODEL
+        if "Eagle3DeepseekV2ForCausalLM" in model_configs["architectures"]:
+            _IS_DRAFTER_MOE_MODEL = False
     return _IS_DRAFTER_MOE_MODEL
 
 
@@ -1198,6 +1119,88 @@ def is_hierarchical_communication_enabled():
     ) or get_ascend_config().enable_mc2_hierarchy_comm
 
 
+def is_pd_decode_recompute_scheduler_enabled(vllm_config: VllmConfig | None = None) -> bool:
+    """True on PD-disaggregated decode nodes with recompute_scheduler_enable.
+
+    After KV recv, RecomputeScheduler sets num_computed_tokens to N-1 so the
+    decode node recomputes the last prompt token before MTP decode. Worker
+    metadata must not treat that step as prefill.
+    """
+    try:
+        if vllm_config is None:
+            try:
+                from vllm.config import get_current_vllm_config
+
+                vllm_config = get_current_vllm_config()
+            except AssertionError:
+                vllm_config = get_ascend_config().vllm_config
+        if vllm_config is None:
+            return False
+        kv_cfg = vllm_config.kv_transfer_config
+        if kv_cfg is None or not kv_cfg.is_kv_consumer or kv_cfg.is_kv_producer:
+            return False
+        return get_ascend_config().recompute_scheduler_enable
+    except (RuntimeError, AttributeError):
+        return False
+
+
+def _compute_potential_max_tokens(vllm_config) -> int:
+    """Maximal decode token count, pure arithmetic over config.
+
+    The formula lives in exactly one place; it is evaluated once via
+    set_potential_max_tokens (model runner __init__) and then reused everywhere
+    via get_potential_max_tokens. Cheap (no select_moe_comm_method).
+    """
+    compilation_config = vllm_config.compilation_config
+    scheduler_config = vllm_config.scheduler_config
+    speculative_config = vllm_config.speculative_config
+    uniform_decode_query_len = 1 if not speculative_config else 1 + speculative_config.num_speculative_tokens
+
+    # Use max cudagraph capture size if available, otherwise the maximal uniform
+    # decode token count.
+    if compilation_config.cudagraph_capture_sizes:
+        potential_max_tokens = max(
+            compilation_config.max_cudagraph_capture_size,
+            min(
+                scheduler_config.max_num_batched_tokens,
+                scheduler_config.max_num_seqs * uniform_decode_query_len,
+            ),
+        )
+        if potential_max_tokens != compilation_config.max_cudagraph_capture_size:
+            logger.warning_once(
+                "The max_cudagraph_capture_size (%d) is smaller than the potential max tokens required for "
+                "decode (%d). This may lead to suboptimal performance. Consider adjusting"
+                "max_cudagraph_capture_size or scheduler_config (max_num_batched_tokens or max_num_seqs)"
+                "to ensure max_cudagraph_capture_size can accommodate the decode workload. For more details, "
+                "see the issue #8240(https://github.com/vllm-project/vllm-ascend/issues/8240).",
+                compilation_config.max_cudagraph_capture_size,
+                potential_max_tokens,
+            )
+    else:
+        potential_max_tokens = min(scheduler_config.max_num_seqs * uniform_decode_query_len, 512)
+    return potential_max_tokens
+
+
+# potential_max_tokens is computed once in the model runner __init__ and reused by
+# both the skip-allreduce decision and the o_proj static-exchange buffer sizing, so
+# neither path recomputes it.
+_potential_max_tokens: int | None = None
+
+
+def set_potential_max_tokens(vllm_config) -> None:
+    """Compute and cache potential_max_tokens once (called from model runner __init__)."""
+    global _potential_max_tokens
+    if _potential_max_tokens is not None:
+        return
+    _potential_max_tokens = _compute_potential_max_tokens(vllm_config)
+
+
+def get_potential_max_tokens() -> int:
+    # Set once in NPUModelRunner.__init__ before any caller reads it.
+    assert _potential_max_tokens is not None
+    return _potential_max_tokens
+
+
 def should_skip_allreduce_across_dp_group(vllm_config, is_draft_model: bool = False) -> bool:
     """Decide whether to skip the all-reduce across the DP group.
 
@@ -1211,6 +1214,10 @@ def should_skip_allreduce_across_dp_group(vllm_config, is_draft_model: bool = Fa
 
     Returns False when hierarchy comm is enabled because hierarchy requires
     global_bs=0 (uniform tokens), which is incompatible with skipping allreduce.
+
+    Recomputed per call (no memoization): potential_max_tokens is a set/get global
+    computed once in init, and select_moe_comm_method is just config lookups, so
+    this is cheap and avoids id-reuse / stale-cache / init-ordering hazards.
     """
     if is_hierarchical_communication_enabled():
         return False
@@ -1232,37 +1239,9 @@ def should_skip_allreduce_across_dp_group(vllm_config, is_draft_model: bool = Fa
     def needs_mc2(n: int) -> bool:
         return select_moe_comm_method(n, vllm_config) in {MoECommType.MC2, MoECommType.FUSED_MC2}
 
-    compilation_config = vllm_config.compilation_config
     scheduler_config = vllm_config.scheduler_config
-    speculative_config = vllm_config.speculative_config
-    uniform_decode_query_len = 1 if not speculative_config else 1 + speculative_config.num_speculative_tokens
-    decode_max_num_seqs = getattr(scheduler_config, "decode_max_num_seqs", 0)
-    max_num_reqs = max(scheduler_config.max_num_seqs, decode_max_num_seqs)
-
-    # Determine whether decode must use MC2. Use max cudagraph capture size
-    # if available, otherwise use the maximal uniform decode token count.
-    if compilation_config.cudagraph_capture_sizes:
-        potential_max_tokens = max(
-            compilation_config.max_cudagraph_capture_size,
-            min(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                vllm_config.scheduler_config.max_num_seqs * uniform_decode_query_len,
-            ),
-        )
-        if potential_max_tokens != compilation_config.max_cudagraph_capture_size:
-            logger.warning_once(
-                "The max_cudagraph_capture_size (%d) is smaller than the potential max tokens required for "
-                "decode (%d). This may lead to suboptimal performance. Consider adjusting"
-                "max_cudagraph_capture_size or scheduler_config (max_num_batched_tokens or max_num_seqs)"
-                "to ensure max_cudagraph_capture_size can accommodate the decode workload. For more details, "
-                "see the issue #8240(https://github.com/vllm-project/vllm-ascend/issues/8240).",
-                compilation_config.max_cudagraph_capture_size,
-                potential_max_tokens,
-            )
-    else:
-        potential_max_tokens = min(max_num_reqs * uniform_decode_query_len, 512)
-
-    decode_must_use_mc2 = needs_mc2(potential_max_tokens)
+    # potential_max_tokens is read from the set/get global (computed once in init).
+    decode_must_use_mc2 = needs_mc2(get_potential_max_tokens())
     # For prefill, use the scheduler's max_num_batched_tokens for a single batch.
     prefill_must_use_mc2 = needs_mc2(scheduler_config.max_num_batched_tokens)
     # Skip all-reduce if decode requires MC2 and either prefill also
@@ -1379,8 +1358,15 @@ def refresh_block_size(vllm_config):
         return
 
     if model_config.hf_config.model_type == "deepseek_v4":
-        # TODO(qcs): generalize the block_size
-        cache_config.block_size = 128
+        if cache_config.block_size is None:
+            cache_config.block_size = 32
+        elif cache_config.block_size not in [32, 64, 128]:
+            logger.warning(
+                "For deepseek_v4 model, block size should be 32, 64 or 128. "
+                "Setting block size to 32 for better performance."
+            )
+            cache_config.block_size = 32
+        return
 
     if model_config.is_hybrid:
         # Hybrid attention+mamba models rely on the model-specific sizing
@@ -1398,7 +1384,12 @@ def refresh_block_size(vllm_config):
     except RuntimeError:
         ascend_config = None
     if ascend_config is not None and ascend_config.xlite_graph_config.enabled and cache_config.block_size > 128:
-        logger.warning("Setting block size to 128 for xlite compatibility.")
+        logger.warning(
+            "Setting block size for xlite compatibility. "
+            "original_block_size=%d, new_block_size=128. "
+            "xlite_graph_config requires block_size <= 128.",
+            cache_config.block_size,
+        )
         cache_config.block_size = 128
 
 
@@ -1434,6 +1425,53 @@ def check_kv_extra_config(vllm_config):
         _check("prefill", vllm_config.kv_transfer_config.get_from_extra_config("prefill", {}))
     if vllm_config.kv_transfer_config.is_kv_consumer:
         _check("decode", vllm_config.kv_transfer_config.get_from_extra_config("decode", {}))
+
+
+def is_gqa_backend(vllm_config: VllmConfig) -> bool:
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is None:
+        return False
+
+    if getattr(model_config, "is_deepseek_mla", False) or getattr(model_config, "use_mla", False):
+        return False
+
+    model_arch_config = getattr(model_config, "model_arch_config", None)
+    total_num_attention_heads = getattr(model_arch_config, "total_num_attention_heads", None)
+    get_total_num_kv_heads = getattr(model_config, "get_total_num_kv_heads", None)
+    if total_num_attention_heads is None or not callable(get_total_num_kv_heads):
+        return False
+
+    total_num_kv_heads = get_total_num_kv_heads()
+    if total_num_kv_heads is None:
+        return False
+
+    return total_num_attention_heads != total_num_kv_heads
+
+
+def uses_mooncake_connector(kv_transfer_config: Any) -> bool:
+    mooncake_connector_names = {"MooncakeConnector", "MooncakeConnectorV1"}
+    return bool(_collect_kv_connector_names(kv_transfer_config) & mooncake_connector_names)
+
+
+def _collect_kv_connector_names(value: Any) -> set[str]:
+    connector_names: set[str] = set()
+    if isinstance(value, dict):
+        connector = value.get("kv_connector")
+        if isinstance(connector, str):
+            connector_names.add(connector)
+        for nested_value in value.values():
+            connector_names.update(_collect_kv_connector_names(nested_value))
+    elif isinstance(value, (list, tuple)):
+        for nested_value in value:
+            connector_names.update(_collect_kv_connector_names(nested_value))
+    else:
+        connector = getattr(value, "kv_connector", None)
+        if isinstance(connector, str):
+            connector_names.add(connector)
+        extra_config = getattr(value, "kv_connector_extra_config", None)
+        if isinstance(extra_config, (dict, list, tuple)):
+            connector_names.update(_collect_kv_connector_names(extra_config))
+    return connector_names
 
 
 def singleton(cls):
@@ -1650,9 +1688,16 @@ def get_compressed_pos_and_indices(
 
 
 def kv_cache_spec_uses_sparse_c8(kv_cache_spec) -> bool:
-    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+    from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 
-    return isinstance(kv_cache_spec, MLAAttentionSpec) and bool(getattr(kv_cache_spec, "cache_sparse_c8", False))
+    return isinstance(kv_cache_spec, AscendMLAAttentionSpec) and bool(getattr(kv_cache_spec, "cache_sparse_c8", False))
+
+
+def is_hidden_state_cache_spec(spec) -> bool:
+    """Whether ``spec`` marks an ``extract_hidden_states`` cache-only layer."""
+    from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
+
+    return isinstance(spec, HiddenStateCacheSpec)
 
 
 @lru_cache(maxsize=1)

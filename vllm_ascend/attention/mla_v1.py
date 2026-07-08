@@ -17,7 +17,7 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # type: ignore
-from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -42,6 +42,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_draft_graph_params_workspaces,
     update_graph_params_workspaces,
 )
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
@@ -169,6 +170,7 @@ class AscendMLADecodeMetadata:
     sin: torch.Tensor = None
     cos: torch.Tensor = None
     cp_seq_len: torch.Tensor = None
+    dcp_mtp_attn_mask: torch.Tensor = None
 
 
 @dataclass
@@ -235,7 +237,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
 
     def __init__(
         self,
-        kv_cache_spec: MLAAttentionSpec,
+        kv_cache_spec: AscendMLAAttentionSpec,
         layer_names: list[str],
         vllm_config: VllmConfig,
         device: torch.device,
@@ -434,7 +436,11 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 
         self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = (
-            split_decodes_and_prefills(common_attn_metadata, decode_threshold=self.decode_threshold)
+            split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.decode_threshold,
+                treat_short_extends_as_decodes=common_attn_metadata.prefill_context_parallel_metadata is None,
+            )
         )
         self.set_num_actual_tokens(common_attn_metadata)
         assert self.num_decodes + self.num_prefills == num_reqs
@@ -770,7 +776,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                 self.layer_sharding_kwargs.append(kwargs[layer_name])
             else:
                 logger.warning_once(
-                    f"Layer '{layer_name}' not found in kwargs for layer sharding, skipping sharding configuration"
+                    f"Layer '{layer_name}' not found in kwargs, skipping sharding. "
+                    f"Check layer_sharding config and model layer names."
                 )
         register_all_layers_to_shard_weight_series(self.layer_sharding_kwargs)
 
@@ -971,9 +978,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             ):
                 self.enable_mlapo = False
                 logger.warning_once(
-                    "Currently mlapo only supports W8A8 quantization in MLA scenario."
-                    "Some layers in your model are not quantized with W8A8,"
-                    "thus mlapo is disabled for these layers."
+                    "mlapo only supports W8A8 quantization in MLA. "
+                    "Some layers not W8A8 quantized, mlapo disabled for these layers."
                 )
         if self.enable_mlapo:
             if get_ascend_device_type() == AscendDeviceType.A5:

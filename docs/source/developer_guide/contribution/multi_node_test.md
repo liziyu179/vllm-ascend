@@ -78,38 +78,38 @@ From the workflow perspective, we can see how the final test script is executed,
 
 Currently, the multi-node test workflow is defined in `.github/workflows/schedule_nightly_test_a3.yaml`.
 
-    ```yaml
-    multi-node-tests:
-      name: multi-node
-      if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-      strategy:
-        fail-fast: false
-        max-parallel: 1
-        matrix:
-          test_config:
-            - name: multi-node-deepseek-pd
-              config_file_path: DeepSeek-V3.yaml
-              size: 2
-            - name: multi-node-qwen3-dp
-              config_file_path: Qwen3-235B-A22B.yaml
-              size: 2
-            - name: GLM5_1-W8A8-EP-external
-              config_file_path: GLM5_1-W8A8-EP-external.yaml
-              config_base_path: tests/e2e/nightly/multi_node/external_dp/config/
-              size: 4
-      uses: ./.github/workflows/_e2e_nightly_multi_node.yaml
-      with:
-        soc_version: a3
-        runner: linux-aarch64-a3-0
-        image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:nightly-a3'
-        replicas: 1
-        size: ${{ matrix.test_config.size }}
-        config_file_path: ${{ matrix.test_config.config_file_path }}
-        config_base_path: ${{ matrix.test_config.config_base_path || '' }}
-        name: ${{ matrix.test_config.name }}
-      secrets:
-        KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
-    ```
+```yaml
+multi-node-tests:
+  name: multi-node
+  if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+  strategy:
+    fail-fast: false
+    max-parallel: 1
+    matrix:
+      test_config:
+        - name: multi-node-deepseek-pd
+          config_file_path: DeepSeek-V3.yaml
+          size: 2
+        - name: multi-node-qwen3-dp
+          config_file_path: Qwen3-235B-A22B.yaml
+          size: 2
+        - name: GLM5_1-W8A8-EP-external
+          config_file_path: GLM5_1-W8A8-EP-external.yaml
+          config_base_path: tests/e2e/nightly/multi_node/external_dp/config/
+          size: 4
+  uses: ./.github/workflows/_e2e_nightly_multi_node.yaml
+  with:
+    soc_version: a3
+    runner: linux-aarch64-a3-0
+    image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:nightly-a3'
+    replicas: 1
+    size: {% raw %}${{ matrix.test_config.size }}{% endraw %}
+    config_file_path: {% raw %}${{ matrix.test_config.config_file_path }}{% endraw %}
+    config_base_path: {% raw %}${{ matrix.test_config.config_base_path || '' }}{% endraw %}
+    name: {% raw %}${{ matrix.test_config.name }}{% endraw %}
+  secrets:
+    KUBECONFIG_B64: {% raw %}${{ secrets.KUBECONFIG_B64 }}{% endraw %}
+```
   
 The matrix above defines all the parameters required to add a multi-machine use
 case. The parameters worth noting are `size`, `config_file_path`, and
@@ -311,7 +311,8 @@ This section assumes that you already have a [Kubernetes](https://kubernetes.io/
     [2025-12-30 11:01:01] INFO multi_node_config.py:348: Resolving cluster IPs via DNS...
     [2025-12-30 11:01:01] INFO multi_node_config.py:212: Node 0 envs: {'VLLM_USE_MODELSCOPE': 'True', 'OMP_PROC_BIND': 'False', 'OMP_NUM_THREADS': '100', 'HCCL_BUFFSIZE': '1024', 'SERVER_PORT': '8080', 'NUMEXPR_MAX_THREADS': '128', 'DISAGGREGATED_PREFILL_PROXY_SCRIPT': 'examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py', 'HCCL_IF_IP': '10.0.0.102', 'HCCL_SOCKET_IFNAME': 'eth0', 'GLOO_SOCKET_IFNAME': 'eth0', 'TP_SOCKET_IFNAME': 'eth0', 'LOCAL_IP': '10.0.0.102', 'NIC_NAME': 'eth0', 'MASTER_IP': '10.0.0.102'}
     [2025-12-30 11:01:01] INFO multi_node_config.py:159: Launching proxy: python examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py --host 10.0.0.102 --port 6000 --prefiller-hosts 10.0.0.102 --prefiller-ports 8080 --decoder-hosts 10.0.0.138 --decoder-ports 8080
-    [2025-12-30 11:01:01] INFO conftest.py:107: Starting server with command: vllm serve vllm-ascend/DeepSeek-V3-W8A8 --host 0.0.0.0 --port 8080 --data-parallel-size 2 --data-parallel-size-local 2 --tensor-parallel-size 8 --seed 1024 --enforce-eager --enable-expert-parallel --max-num-seqs 16 --max-model-len 8192 --max-num-batched-tokens 8192 --quantization ascend --trust-remote-code --no-enable-prefix-caching --gpu-memory-utilization 0.9 --kv-transfer-config {"kv_connector": "MooncakeConnectorV1", "kv_role": "kv_producer", "kv_port": "30000", "engine_id": "0", "kv_connector_extra_config": {
+    [2025-12-30 11:01:01] INFO conftest.py:107: Starting server with command: vllm serve vllm-ascend/DeepSeek-V3-W8A8 --host 0.0.0.0 --port 8080 --data-parallel-size 2 --data-parallel-size-local 2 --tensor-parallel-size 8 --seed 1024 --enforce-eager --enable-expert-parallel --max-num-seqs 16 --max-model-len 8192 --max-num-batched-tokens 8192 --quantization ascend --trust-remote-code --no-enable-prefix-caching --gpu-memory-utilization 0.9 --kv-transfer-config {"kv_connector": "MooncakeConnectorV1", "kv_role": "kv_producer", "kv_port": "30000", 
+    "kv_connector_extra_config": {
             "prefill": {
                     "dp_size": 2,
                     "tp_size": 8

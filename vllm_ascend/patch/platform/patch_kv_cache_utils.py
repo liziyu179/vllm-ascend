@@ -17,6 +17,8 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.utils import vllm_version_is
+
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 
 
@@ -50,7 +52,10 @@ def _ascend_resolve_kv_cache_block_sizes(
         # multiplied by the CP factors for proper alignment.
         group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
         scheduler_block_size = math.lcm(*group_block_sizes) * dcp * pcp
-        return scheduler_block_size, scheduler_block_size
+        if not cache_config.enable_prefix_caching:
+            return scheduler_block_size, scheduler_block_size
+        hash_block_size = math.gcd(*group_block_sizes)
+        return scheduler_block_size, hash_block_size
 
     return _orig_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
 
@@ -246,8 +251,14 @@ def _get_kv_cache_config_deepseek_v4(
 
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
-vllm.v1.core.kv_cache_utils._get_kv_cache_config_deepseek_v4 = _get_kv_cache_config_deepseek_v4
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
+# vllm v0.24.0 renamed _get_kv_cache_config_deepseek_v4 to _get_kv_cache_config_packed and
+# get_kv_cache_config_from_groups now calls _get_kv_cache_config_packed directly, bypassing
+# the alias patch above. Patch the canonical name so Ascend's non-packed layout is used.
+if vllm_version_is("0.23.0"):
+    vllm.v1.core.kv_cache_utils._get_kv_cache_config_deepseek_v4 = _get_kv_cache_config_deepseek_v4
+else:
+    vllm.v1.core.kv_cache_utils._get_kv_cache_config_packed = _get_kv_cache_config_deepseek_v4
 
 # Also patch the reference used by engine/core.py which imports the function directly.
 import vllm.v1.engine.core  # noqa: E402
